@@ -32,7 +32,7 @@ ignore_missing_imports = true
 
 [tool.poetry]
 name = "protocol-proxy-modbus"
-version = "2.0.0rc3"
+version = "2.0.0rc0"
 description = "A Modbus Protocol Proxy implementation."
 authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
 license = "Apache-2.0"
