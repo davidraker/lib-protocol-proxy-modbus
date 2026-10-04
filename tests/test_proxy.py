@@ -51,9 +51,12 @@ def make_proxy():
                        registration_timeout=0.05)
 
 
-async def call(proxy, name, remote=None, **message):
+REMOTE = uuid4()      # the caller's remote id, carried in every header
+
+
+async def call(proxy, name, remote=REMOTE, **message):
     """Invoke an endpoint the way the IPC layer would after authenticating the caller, and decode its reply.
-    ``remote`` is the header's remote id (version 2); None is a version 1 caller naming the device in the payload."""
+    ``remote`` is the header's remote id, which is how the proxy knows which device and unit a request concerns."""
     endpoint = {'REGISTER_DEVICE': proxy.register_device_endpoint,
                 'CONFIGURE_REGISTERS': proxy.configure_registers_endpoint,
                 'READ_REGISTERS': proxy.read_registers_endpoint,
@@ -158,8 +161,8 @@ def test_read_and_write_endpoints():
         reply = await call(proxy, 'WRITE_REGISTERS', **DEVICE, queries=[[1010, 1, [5]]])
         assert reply == {'result': [{'address': 1010, 'count': 1}], 'error': [None]}
 
-        assert await call(proxy, 'READ_REGISTERS', device_address='9.9.9.9', device_type='tcp') is None
-        assert await call(proxy, 'WRITE_REGISTERS', device_address='9.9.9.9', device_type='tcp', queries=[]) is None
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4()) is None                      # unregistered remote
+        assert await call(proxy, 'WRITE_REGISTERS', remote=uuid4(), queries=[]) is None
     asyncio.run(main())
 
 
@@ -226,8 +229,10 @@ def test_remote_id_in_the_header_identifies_the_client_and_unit(monkeypatch):
         assert client.calls[-1][:4] == ('write', [[1, None, 5]], 'holding', 4)
         await call(proxy, 'READ_REGISTERS', remote=remote_b, queries=[[1, 1]], unit_id=9)       # a payload unit id overrides
         assert client.calls[-1][3] == 9
-        assert await call(proxy, 'READ_REGISTERS', remote=uuid4(), queries=[[1, 1]]) is None   # unknown remote, no device named
-        # A version 1 caller still names the device in the payload.
-        await call(proxy, 'READ_REGISTERS', device_address='10.0.0.4', device_type='tcp', port=502, unit_id=2, queries=[[1, 1]])
-        assert client.calls[-1][3] == 2
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4(), queries=[[1, 1]]) is None   # unknown remote
+        # Payload identity fields are not a substitute for the header, and are not passed on as request options.
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4(), device_address='10.0.0.4', device_type='tcp', port=502,
+                          queries=[[1, 1]]) is None
+        reply = await call(proxy, 'REGISTER_DEVICE', remote=None, device_address='10.0.0.4', device_type='tcp', port=502)
+        assert 'remote id' in reply['error']['device']
     asyncio.run(main())

@@ -54,10 +54,12 @@ class ModbusProxy(AsyncioProtocolProxy):
         Payload: device_address, device_type, and any pymodbus client options (port, timeout, retries, ...).
         May also carry the CONFIGURE_REGISTERS fields (unit_id, tables, max_gap, clear_others) to declare the
         device's register data types in the same round trip. The caller's remote id (header version 2) is remembered
-        with the client and unit id, so later requests from that caller need neither in their payload.
+        with the client and unit id; it is how every later request from that caller names them.
         """
         message = json.loads(raw_message.decode('utf8'))
         remote_id = getattr(headers, 'remote_id', None)
+        if remote_id is None:
+            return serialize({'results': {}, 'errors': {'device': 'REGISTER_DEVICE needs the remote id in its header (version 2).'}})
         device_address = message.pop('device_address')
         transport_protocol = message.pop('device_type')
         client_key = self._get_client_key(device_address, transport_protocol, message)
@@ -68,8 +70,7 @@ class ModbusProxy(AsyncioProtocolProxy):
         try:
             if client_key not in self.clients:
                 self.clients[client_key] = await ModbusClient.create(device_address, transport_protocol, **message)
-            if remote_id is not None:
-                self.remotes[remote_id] = (client_key, int(configure_args.get('unit_id', 1)))
+            self.remotes[remote_id] = (client_key, int(configure_args.get('unit_id', 1)))
             results = {'client': client_key}
             if tables is not None:
                 results.update(self.clients[client_key].configure_registers(tables, **configure_args))
@@ -79,37 +80,35 @@ class ModbusProxy(AsyncioProtocolProxy):
             return serialize({'results': {}, 'errors': {'device': str(e)}})
 
     @callback
-    async def configure_registers_endpoint(self, _, raw_message: bytes):
-        """Endpoint for declaring the data types of registers on a Modbus device.
+    async def configure_registers_endpoint(self, headers, raw_message: bytes):
+        """Endpoint for declaring the data types of registers on a Modbus device the caller registered.
 
-        Payload: device_address, device_type, [port], unit_id (default 1), tables, [max_gap], [clear_others].
+        Payload: tables, [unit_id] (default: the registered unit), [max_gap], [clear_others].
         tables maps a table name ('coil', 'discrete_input', 'holding', 'input') to a list of specs, each
         {address, data_type, [count], [word_order], [string_encoding]}. Pads are specs with data_type 'pad'.
         Each listed table is replaced whole. Other tables on the unit are kept unless clear_others is true.
         """
         message = json.loads(raw_message.decode('utf8'))
-        device_address = message.pop('device_address')
-        transport_protocol = message.pop('device_type')
-        client = self._get_client(device_address, transport_protocol, message, 'configure')
+        client, unit_id = self._resolve(headers, message, 'configure')
         if client is None:
             return serialize({'results': {}, 'errors': {'device': 'Client not found'}})
         try:
             results = client.configure_registers(message.get('tables', {}),
-                                                 unit_id=message.get('unit_id', 1),
+                                                 unit_id=unit_id,
                                                  max_gap=message.get('max_gap'),
                                                  clear_others=message.get('clear_others', False))
             return serialize({'results': results, 'errors': {}})
         except (ValueError, TypeError, KeyError, AttributeError) as e:
-            _log.warning(f"Failed to configure Modbus registers for {device_address}: {e}")
+            _log.warning(f"Failed to configure Modbus registers for remote {getattr(headers, 'remote_id', None)}: {e}")
             return serialize({'results': {}, 'errors': {'configure': str(e)}})
 
     @callback
     async def read_registers_endpoint(self, headers, raw_message: bytes):
         """Endpoint for reading registers from a Modbus device.
 
-        Payload: [queries], [register_map], [decode], and for a caller without a remote id in its header
-        (version 1) device_address, device_type, [port], [unit_id]. With decode true, values are decoded using the
-        map declared via CONFIGURE_REGISTERS, and queries may be omitted to read the whole map in the fewest requests.
+        Payload: [queries], [register_map], [decode], [unit_id] (default: the registered unit). With decode true,
+        values are decoded using the map declared via CONFIGURE_REGISTERS, and queries may be omitted to read the
+        whole map in the fewest requests.
         """
         message = json.loads(raw_message.decode('utf8'))
         client, unit_id = self._resolve(headers, message, 'read')
@@ -128,9 +127,8 @@ class ModbusProxy(AsyncioProtocolProxy):
     async def write_registers_endpoint(self, headers, raw_message: bytes):
         """Endpoint for writing registers to a Modbus device.
 
-        Payload: queries, [register_map], [encode], and for a caller without a remote id in its header (version 1)
-        device_address, device_type, [port], [unit_id]. With encode true, each query's value is encoded using the map
-        declared via CONFIGURE_REGISTERS.
+        Payload: queries, [register_map], [encode], [unit_id] (default: the registered unit). With encode true, each
+        query's value is encoded using the map declared via CONFIGURE_REGISTERS.
         """
         message = json.loads(raw_message.decode('utf8'))
         client, unit_id = self._resolve(headers, message, 'write')
@@ -146,34 +144,23 @@ class ModbusProxy(AsyncioProtocolProxy):
         return serialize(result)
 
     def _resolve(self, headers, message: dict, action: str) -> tuple[ModbusClient | None, int]:
-        """The client and unit id a request concerns: the header's remote id first, the payload's identity otherwise.
+        """The client and unit id a request concerns, by the remote id in its header.
 
-        Removes the identity fields from ``message`` so the remainder can be passed on as request options. A payload
-        ``unit_id`` overrides the registered one.
+        A payload ``unit_id`` overrides the registered one; stray identity fields in the payload are discarded so the
+        remainder can be passed on as request options.
         """
         remote_id = getattr(headers, 'remote_id', None)
-        device_address = message.pop('device_address', None)
-        transport_protocol = message.pop('device_type', None)
+        for stale in ('device_address', 'device_type', 'port'):
+            message.pop(stale, None)
         registered = self.remotes.get(remote_id) if remote_id else None
-        if registered is not None:
-            client_key, unit_id = registered
-            client = self.clients.get(client_key)
-            if client is None:
-                _log.warning(f'Failed to {action} modbus registers: the client for remote {remote_id} is gone.')
-            return client, int(message.pop('unit_id', unit_id))
-        if device_address is None or transport_protocol is None:
-            _log.warning(f'Failed to {action} modbus registers: unknown remote {remote_id} and no device named in the payload.')
+        if registered is None:
+            _log.warning(f'Failed to {action} modbus registers: remote {remote_id} has no registered device.')
             return None, 1
-        return self._get_client(device_address, transport_protocol, message, action), int(message.pop('unit_id', 1))
-
-    def _get_client(self, device_address: str, transport_protocol: str, message: dict, action: str
-                    ) -> ModbusClient | None:
-        client_key = self._get_client_key(device_address, transport_protocol, message)
-        client = self.clients.get(client_key) if client_key else None
+        client_key, unit_id = registered
+        client = self.clients.get(client_key)
         if client is None:
-            _log.warning(f"Failed to {action} modbus registers."
-                         f" A {transport_protocol} client for device {device_address} was not found.")
-        return client
+            _log.warning(f'Failed to {action} modbus registers: the client for remote {remote_id} is gone.')
+        return client, int(message.pop('unit_id', unit_id))
 
     @staticmethod
     def _get_client_key(device_address: str, transport_protocol: str, message: dict) -> str:
