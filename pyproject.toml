@@ -32,7 +32,7 @@ ignore_missing_imports = true
 
 [tool.poetry]
 name = "protocol-proxy-modbus"
-version = "2.0.0rc0"
+version = "2.0.0rc1"
 description = "A Modbus Protocol Proxy implementation."
 authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
 license = "Apache-2.0"
@@ -76,3 +76,6 @@ ignore_patterns = [
     "dist/**",
     "docs/**"
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

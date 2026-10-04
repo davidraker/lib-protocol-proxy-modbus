@@ -7,6 +7,8 @@ import sys
 
 from typing import Iterable
 
+from functools import partial
+
 from protocol_proxy.ipc import callback, ProtocolProxyMessage
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
@@ -14,15 +16,24 @@ from pymodbus import pymodbus_apply_logging_config
 
 from .json import serialize
 from .client import ModbusClient
+from .server import ServedModbusDevice
 
 _log = logging.getLogger(__name__)
 
 
-class ModbusProxy(AsyncioProtocolProxy):
-    """One proxy process serves any number of Modbus devices over any mix of transports.
+ROLES = {'master': 'master', 'client': 'master', 'slave': 'slave', 'server': 'slave', 'outstation': 'slave'}
 
-    Clients (one per gateway, keyed by transport, address and port) are created by REGISTER_DEVICE; each holds the
-    register data types of every unit behind it, declared via CONFIGURE_REGISTERS.
+
+class ModbusProxy(AsyncioProtocolProxy):
+    """One proxy process serves any number of Modbus devices over any mix of transports, and any number of Modbus TCP
+    slaves served to remote masters, in either role as the registration says.
+
+    Clients (one per gateway, keyed by transport, address and port) are created by REGISTER_REMOTE (or its older name
+    REGISTER_DEVICE) with role ``master`` (the default); each holds the register data types of every unit behind it,
+    declared via CONFIGURE_REGISTERS. Role ``slave`` (``server``) makes the proxy serve a unit instead: a pymodbus TCP
+    server on ``bind_host:port`` whose registers hold the registered points. Reads and writes to a served unit are
+    keyed by topic (READ_POINTS ``topics``, WRITE_POINTS ``values``) and the master's accepted writes are pushed as
+    RECEIVE_WRITES, tagged with the caller's remote id. CLOSE_REMOTE stops a served unit.
     """
     # Requests to units sharing a gateway queue behind one another (see ModbusClient), so a request may legitimately
     # wait for several other units' timeout-and-retry cycles before it runs. This bounds how long the IPC layer
@@ -33,13 +44,17 @@ class ModbusProxy(AsyncioProtocolProxy):
         pymodbus_apply_logging_config('INFO')
         super(ModbusProxy, self).__init__(**kwargs)
         self.clients: dict[str, ModbusClient] = {}
+        self.servers: dict[str, ServedModbusDevice] = {}        # served units, by listener and unit id
         # The caller's remote id (header version 2) -> (client key, unit id) it registered. Several remotes (unit ids)
-        # share one client when they sit behind the same gateway connection.
+        # share one client when they sit behind the same gateway connection. A served unit's key starts with 'served:'.
         self.remotes: dict[UUID, tuple[str, int]] = {}
         self.loop = asyncio.get_event_loop()
 
-        self.register_callback(self.register_device_endpoint, 'REGISTER_DEVICE', provides_response=True,
-                               timeout=callback_timeout)
+        for name in ('REGISTER_REMOTE', 'REGISTER_DEVICE'):
+            self.register_callback(self.register_device_endpoint, name, provides_response=True, timeout=callback_timeout)
+        self.register_callback(self.read_points_endpoint, 'READ_POINTS', provides_response=True, timeout=callback_timeout)
+        self.register_callback(self.write_points_endpoint, 'WRITE_POINTS', provides_response=True, timeout=callback_timeout)
+        self.register_callback(self.close_remote_endpoint, 'CLOSE_REMOTE', provides_response=True, timeout=callback_timeout)
         self.register_callback(self.configure_registers_endpoint, 'CONFIGURE_REGISTERS', provides_response=True,
                                timeout=callback_timeout)
         self.register_callback(self.read_registers_endpoint, 'READ_REGISTERS', provides_response=True,
@@ -59,7 +74,14 @@ class ModbusProxy(AsyncioProtocolProxy):
         message = json.loads(raw_message.decode('utf8'))
         remote_id = getattr(headers, 'remote_id', None)
         if remote_id is None:
-            return serialize({'results': {}, 'errors': {'device': 'REGISTER_DEVICE needs the remote id in its header (version 2).'}})
+            return serialize({'results': {}, 'errors': {'device': 'Registration needs the remote id in its header (version 2).'}})
+        role = ROLES.get(str(message.pop('role', None) or 'master').lower())
+        if role is None:
+            return serialize({'results': {}, 'errors': {'device': 'Unknown role; expected master or slave.'}})
+        if role == 'slave':
+            return await self._register_served(remote_id, message)
+        if 'device_address' not in message:
+            return serialize({'results': {}, 'errors': {'device': 'Registering a device to reach needs a device_address.'}})
         device_address = message.pop('device_address')
         transport_protocol = message.pop('device_type')
         client_key = self._get_client_key(device_address, transport_protocol, message)
@@ -78,6 +100,82 @@ class ModbusProxy(AsyncioProtocolProxy):
         except Exception as e:
             _log.warning(f"Failed to register Modbus device {device_address}: {e}")
             return serialize({'results': {}, 'errors': {'device': str(e)}})
+
+    @staticmethod
+    def server_key(message: dict) -> str:
+        return f"served:{message.get('bind_host', '0.0.0.0')}:{message.get('port', 502)}:{message.get('unit_id', 1)}"
+
+    async def _register_served(self, remote_id: UUID, message: dict):
+        """Serve a Modbus TCP unit (role ``slave``). Payload: ``bind_host``, ``port``, ``unit_id``, ``tables`` (per
+        table, spec rows with ``topic``, ``remote_writable`` and ``initial_value``) and optionally ``values`` (the
+        caller's current values for points nothing has written). Reply: ``{'server': key, 'configured': ..., 'seeded': n,
+        'port': bound port}``; everything held is pushed as well."""
+        key = self.server_key(message)
+        served = self.servers.get(key)
+        try:
+            if served is None:
+                served = ServedModbusDevice(message.get('bind_host', '0.0.0.0'), int(message.get('port', 502)),
+                                            unit_id=int(message.get('unit_id', 1)))
+                served.push = partial(self._push, served)
+            served.remote_id = remote_id
+            configured = served.configure_points(message.get('tables') or {})
+            await served.start()
+            await served.seed(message.get('values') or {})
+        except Exception as e:      # a bad row, or whatever the listener's bind raised
+            _log.warning(f'Failed to serve Modbus unit {key}: {e}')
+            if served is not None and key not in self.servers:
+                await served.close()
+            return serialize({'results': {}, 'errors': {'device': str(e)}})
+        self.servers[key] = served
+        self.remotes[remote_id] = (key, served.unit_id)
+        self.loop.create_task(served.push_all())
+        return serialize({'results': {'server': key, 'configured': configured, 'seeded': served.seeded, 'port': served.bound_port},
+                          'errors': {}})
+
+    async def _push(self, served: ServedModbusDevice, values: dict):
+        """Send a master's accepted writes to the manager, keyed by topic and tagged with the caller's remote id."""
+        peer = self.peers.get(self.manager)
+        if peer is None:    # pragma: no cover
+            return
+        await self.send(peer, ProtocolProxyMessage(method_name='RECEIVE_WRITES', payload=serialize(values),
+                                                   remote_id=served.remote_id))
+
+    def _served(self, headers, action: str) -> ServedModbusDevice | None:
+        remote_id = getattr(headers, 'remote_id', None)
+        registered = self.remotes.get(remote_id) if remote_id else None
+        served = self.servers.get(registered[0]) if registered else None
+        if served is None:
+            _log.warning(f'Failed to {action}: remote {remote_id} has no served unit.')
+        return served
+
+    @callback
+    async def read_points_endpoint(self, headers, raw_message: bytes):
+        """The current served values of ``topics`` (all registered points when omitted)."""
+        message = json.loads(raw_message.decode('utf8'))
+        served = self._served(headers, 'read points')
+        if served is None:
+            return serialize({'results': {}, 'errors': {'device': 'No served unit for this remote.'}})
+        results, errors = await served.read(message.get('topics'))
+        return serialize({'results': results, 'errors': errors})
+
+    @callback
+    async def write_points_endpoint(self, headers, raw_message: bytes):
+        """Store ``values`` (``{topic: value}``) in the served registers."""
+        message = json.loads(raw_message.decode('utf8'))
+        served = self._served(headers, 'write points')
+        if served is None:
+            return serialize({'results': {}, 'errors': {'device': 'No served unit for this remote.'}})
+        results, errors = await served.write(message.get('values') or {})
+        return serialize({'results': results, 'errors': errors})
+
+    @callback
+    async def close_remote_endpoint(self, headers, raw_message: bytes):
+        remote_id = getattr(headers, 'remote_id', None)
+        registered = self.remotes.pop(remote_id, None) if remote_id else None
+        served = self.servers.pop(registered[0], None) if registered else None
+        if served is not None:
+            await served.close()
+        return serialize({'results': {'closed': served is not None}, 'errors': {}})
 
     @callback
     async def configure_registers_endpoint(self, headers, raw_message: bytes):

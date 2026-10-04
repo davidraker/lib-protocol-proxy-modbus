@@ -77,6 +77,22 @@ A `tables` block maps a table name to a list of register specifications:
 - **Pads** are registers that are read but never decoded or returned. Two points separated by a pad are fetched in one
   request. `max_gap` lets the proxy read through short unconfigured gaps as well.
 
+## Slave role
+
+A registration whose `role` is `slave` (or `server`) makes the proxy *serve* a Modbus TCP unit instead of reaching one:
+a pymodbus `ModbusTcpServer` on `bind_host:port` answering as `unit_id`, whose four register tables hold the registered
+points. The `tables` block is the same as above, with each row also naming its `topic`, whether the master may write it
+(`remote_writable`; coils and holding registers by default, never inputs or pads) and an `initial_value`. Each table is
+served as one block covering its configured addresses; reads outside it, and writes to pads, to unregistered
+registers or to points that are not remote-writable, are answered with ILLEGAL DATA ADDRESS.
+
+Reads and writes to a served unit are keyed by topic: `READ_POINTS` (`topics`) reports the decoded register values,
+`WRITE_POINTS` (`values`) encodes the platform's values into the registers (any table, including inputs: they are the
+telemetry the unit serves). The master's accepted writes are decoded and pushed as `RECEIVE_WRITES`, tagged with the
+caller's remote id. On (re)registration the proxy pushes every point that holds a value; registration `values` (the
+caller's current values) seed points nothing has written, ahead of their `initial_value`. Re-registering the same
+listener and unit rebuilds the tables and keeps the values of points that stay. `CLOSE_REMOTE` stops a served unit.
+
 ## Request planning
 
 Requests to one gateway share one connection and run one at a time, so units on a serial bus behind a TCP gateway are
