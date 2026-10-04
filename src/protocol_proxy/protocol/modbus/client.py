@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 import logging
 
 from contextlib import asynccontextmanager
@@ -67,6 +68,21 @@ class ModbusClient:
         """Close the connection to the device."""
         self.client.close()
 
+    @staticmethod
+    def tls_context(ca_path: str | None = None, cert_path: str | None = None, key_path: str | None = None, *,
+                    tls_verify: bool = True) -> ssl.SSLContext:
+        """The client's TLS context: the server is checked against ``ca_path`` (or the system's CAs) unless
+        ``tls_verify`` is off, and the client presents ``cert_path``/``key_path`` when given (servers that require
+        client authentication)."""
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_path or None)
+        if cert_path:
+            ctx.load_cert_chain(cert_path, key_path or None)
+        if not tls_verify:
+            _log.warning('Modbus TLS server certificate verification is disabled; the server identity is not checked.')
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
     @classmethod
     async def create(cls, device_address, transport_protocol: str = 'tcp', **kwargs):
         match transport_protocol.lower().strip():
@@ -104,10 +120,10 @@ class ModbusClient:
                     trace_connect=kwargs.get('trace_connect', None),
                 )
             case 'tls':
-                # TODO: Handle param: sslctx: ~ssl.SSLContext = <ssl.SSLContext object>
                 client = AsyncModbusTlsClient(
                     device_address,
-                    sslctx=kwargs.get('sslctx', None),
+                    sslctx=cls.tls_context(kwargs.get('ca_path'), kwargs.get('cert_path'), kwargs.get('key_path'),
+                                           tls_verify=kwargs.get('tls_verify', True)),
                     framer=kwargs.get('framer', FramerType.TLS),
                     port=kwargs.get('port', 802),
                     name=kwargs.get('name', 'comm'),
