@@ -1,38 +1,43 @@
-"""One Modbus TCP server (slave) served by the proxy (the ``slave`` role): the inverse of :mod:`client`.
+"""Modbus units served by the proxy (the ``slave`` role): the inverse of :mod:`client`.
 
-The served values are the register tables of a pymodbus ``SimDevice``: one block per Modbus table (coils, discrete
-inputs, holding registers, input registers) covering the configured addresses, served by a ``ModbusTcpServer`` on
-``host:port`` as unit ``unit_id``. The register data types come from the same :class:`RegisterSpec` rows the client
-role uses, plus a topic, whether the master may write the point (``remote_writable``) and an ``initial_value``.
+A :class:`ModbusListener` is one transport endpoint: a pymodbus server on a TCP, UDP or TLS socket or on a serial
+port, serving one or more :class:`ServedUnit` objects, each a unit id with its own register tables. The served values
+are the register tables of a pymodbus ``SimDevice`` per unit: one block per Modbus table (coils, discrete inputs,
+holding registers, input registers) covering the configured addresses. The register data types come from the same
+:class:`RegisterSpec` rows the client role uses, plus a topic, whether the master may write the point
+(``remote_writable``) and an ``initial_value``.
 
 Platform writes (``WRITE_POINTS``) encode the value into the registers through the datastore API; the master's writes
-reach the ``SimDevice.action`` hook, which refuses them for points that are not remote-writable (ILLEGAL_ADDRESS, as
-Modbus has no better code) and otherwise lets them through, then decodes the affected points and pushes them to the
-caller. Reads from the master are answered by pymodbus from the registers.
+reach the ``SimDevice.action`` hook, which refuses them for pads, unregistered registers and points that are not
+remote-writable (ILLEGAL_ADDRESS, as Modbus has no better code) and otherwise lets them through, then decodes the
+affected points and pushes them to the caller. Reads from the master are answered by pymodbus from the registers. A
+request for a unit the listener does not serve is answered ILLEGAL_ADDRESS by a sentinel unit of invalid registers.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from pymodbus.constants import ExcCodes
-from pymodbus.server import ModbusTcpServer
+from pymodbus.server import ModbusSerialServer, ModbusTcpServer, ModbusTlsServer, ModbusUdpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
 
-from .registers import BIT_TABLES, PAD, RegisterMap, RegisterSpec, parse_type_spec
+from .registers import BIT_TABLES, RegisterMap, RegisterSpec, parse_type_spec
 
 _log = logging.getLogger(__name__)
 
 PushCallback = Callable[[dict[str, Any]], Awaitable[None]]
 TABLES = ('coil', 'discrete_input', 'holding', 'input')
+TRANSPORTS = ('tcp', 'udp', 'tls', 'serial')
 #: Function code the proxy uses to read, and to set, each table through the datastore.
 READ_CODE = {'coil': 1, 'discrete_input': 2, 'holding': 3, 'input': 4}
 #: Which table a master's write function code touches.
 WRITE_TABLE = {5: 'coil', 15: 'coil', 6: 'holding', 16: 'holding', 22: 'holding', 23: 'holding'}
-BIND_TIMEOUT = 5.0
+DEFAULT_PORTS = {'tcp': 502, 'udp': 502, 'tls': 802}
 
 
 @dataclass(frozen=True)
@@ -65,19 +70,19 @@ class ServedPoint:
                    remote_writable=bool(remote_writable) and not spec.is_pad, initial_value=row.get('initial_value'))
 
 
-class ServedModbusDevice:
-    """A pymodbus TCP server on ``host:port`` serving the registered points as unit ``unit_id``."""
+class ServedUnit:
+    """One unit id on a listener: its point table and the values it serves."""
 
-    def __init__(self, host: str, port: int, *, unit_id: int = 1, push: PushCallback | None = None, remote_id=None):
-        self.host, self.port, self.unit_id = host, int(port), int(unit_id)
+    def __init__(self, unit_id: int, push: PushCallback | None = None, remote_id=None):
+        self.unit_id = int(unit_id)
         self.push, self.remote_id = push, remote_id
+        self.listener: ModbusListener | None = None
         self.points: dict[str, ServedPoint] = {}
         self.maps: dict[str, RegisterMap] = {}
         self.by_address: dict[tuple[str, int], ServedPoint] = {}
         self.values: dict[str, Any] = {}             # the last value stored or accepted, by topic
-        self.server: ModbusTcpServer | None = None
-        self._own_write = False
         self.seeded = 0
+        self._own_write = False
 
     # ---- configuration ------------------------------------------------------------------------------------------
     def configure_points(self, tables: dict[str, list[dict]]) -> dict:
@@ -104,18 +109,10 @@ class ServedModbusDevice:
                 for table, reg_map in maps.items()}
 
     def describe(self) -> dict:
-        return {'role': 'slave', 'host': self.host, 'port': self.bound_port, 'unit_id': self.unit_id, 'points': len(self.points),
-                'tables': {t: {'addresses': [m.address for m in reg_map]} for t, reg_map in self.maps.items()},
-                'listening': self.server is not None}
+        return {'unit_id': self.unit_id, 'points': len(self.points),
+                'tables': {t: {'addresses': [m.address for m in reg_map]} for t, reg_map in self.maps.items()}}
 
-    @property
-    def bound_port(self) -> int:
-        transport = getattr(self.server, 'transport', None)
-        sockets = getattr(transport, 'sockets', None)
-        return sockets[0].getsockname()[1] if sockets else self.port
-
-    # ---- lifecycle ----------------------------------------------------------------------------------------------
-    def _blocks(self) -> tuple[list[SimData], list[SimData], list[SimData], list[SimData]]:
+    def sim_device(self) -> SimDevice:
         blocks = []
         for table in TABLES:
             reg_map = self.maps.get(table)
@@ -131,23 +128,36 @@ class ServedModbusDevice:
                 blocks.append([SimData(address=start, count=count, values=False, datatype=DataType.BITS)])
             else:
                 blocks.append([SimData(address=start, count=count, values=0, datatype=DataType.REGISTERS)])
-        return blocks[0], blocks[1], blocks[2], blocks[3]
+        return SimDevice(id=self.unit_id, simdata=(blocks[0], blocks[1], blocks[2], blocks[3]), action=self._action)
 
-    async def start(self, values: dict[str, Any] | None = None, timeout: float = BIND_TIMEOUT):
-        """(Re)build the datastore from the point table and serve it.
+    # ---- values -------------------------------------------------------------------------------------------------
+    @property
+    def _context(self):
+        if self.listener is None or self.listener.server is None:
+            raise ValueError('not serving')
+        return self.listener.server.context
 
-        A point's value comes from, in order: what this process already holds (a platform restart), the caller's
-        current value in ``values`` (the platform's memory, after a proxy restart), the row's ``initial_value``. The
-        number of points seeded from ``values`` is left in ``seeded``.
-        """
+    async def _store(self, point: ServedPoint, value: Any):
+        context = self._context
+        self._own_write = True
+        try:
+            encoded = point.spec.encode(value, point.table in BIT_TABLES)
+            result = await context.async_setValues(self.unit_id, READ_CODE[point.table], point.spec.address, encoded)
+        finally:
+            self._own_write = False
+        if result is not None:
+            raise ValueError(f'datastore refused the write: {result.name}')
+        self.values[point.topic] = point.spec.decode(encoded, point.table in BIT_TABLES)
+
+    async def _current(self, point: ServedPoint):
+        raw = await self._context.async_getValues(self.unit_id, READ_CODE[point.table], point.spec.address, point.spec.count)
+        if isinstance(raw, ExcCodes):
+            raise ValueError(f'datastore refused the read: {raw.name}')
+        return point.spec.decode(raw, point.table in BIT_TABLES)
+
+    async def load(self, values: dict[str, Any] | None, kept: dict[str, Any]):
+        """Fill a freshly built datastore: held values first, then the caller's, then the rows' starting values."""
         values = values or {}
-        kept = {topic: value for topic, value in self.values.items() if topic in self.points}
-        if self.server is not None:
-            await self.server.shutdown()
-            self.server = None
-        device = SimDevice(id=self.unit_id, simdata=self._blocks(), action=self._action)
-        self.server = ModbusTcpServer(device, address=(self.host, self.port))
-        await self.server.serve_forever(background=True)
         self.values = {}
         self.seeded = 0
         for topic, point in self.points.items():
@@ -163,31 +173,7 @@ class ServedModbusDevice:
                 await self._store(point, value)
                 self.seeded += source == 'seed'
             except (ValueError, TypeError) as e:
-                _log.warning(f'{self.host}:{self.port}: {source} value {value!r} for {topic} ignored: {e}')
-        _log.info(f'Serving Modbus unit {self.unit_id} on {self.host}:{self.bound_port} with {len(self.points)} points.')
-
-    async def close(self):
-        if self.server is not None:
-            await self.server.shutdown()
-            self.server = None
-
-    # ---- values -------------------------------------------------------------------------------------------------
-    async def _store(self, point: ServedPoint, value: Any):
-        self._own_write = True
-        try:
-            encoded = point.spec.encode(value, point.table in BIT_TABLES)
-            result = await self.server.context.async_setValues(self.unit_id, READ_CODE[point.table], point.spec.address, encoded)
-        finally:
-            self._own_write = False
-        if result is not None:
-            raise ValueError(f'datastore refused the write: {result.name}')
-        self.values[point.topic] = point.spec.decode(encoded, point.table in BIT_TABLES)
-
-    async def _current(self, point: ServedPoint):
-        raw = await self.server.context.async_getValues(self.unit_id, READ_CODE[point.table], point.spec.address, point.spec.count)
-        if isinstance(raw, ExcCodes):
-            raise ValueError(f'datastore refused the read: {raw.name}')
-        return point.spec.decode(raw, point.table in BIT_TABLES)
+                _log.warning(f'unit {self.unit_id}: {source} value {value!r} for {topic} ignored: {e}')
 
     async def read(self, topics: list[str] | None, **_) -> tuple[dict, dict]:
         topics = list(topics) if topics is not None else list(self.points)
@@ -196,13 +182,11 @@ class ServedModbusDevice:
             point = self.points.get(topic)
             if point is None:
                 errors[topic] = 'unregistered topic'
-            elif self.server is None:
-                errors[topic] = 'not serving'
-            else:
-                try:
-                    results[topic] = await self._current(point)
-                except ValueError as e:
-                    errors[topic] = str(e)
+                continue
+            try:
+                results[topic] = await self._current(point)
+            except ValueError as e:
+                errors[topic] = str(e)
         return results, errors
 
     async def write(self, values: dict[str, Any], **_) -> tuple[dict, dict]:
@@ -212,9 +196,6 @@ class ServedModbusDevice:
             point = self.points.get(topic)
             if point is None:
                 errors[topic] = 'unregistered topic'
-                continue
-            if self.server is None:
-                errors[topic] = 'not serving'
                 continue
             try:
                 await self._store(point, value)
@@ -226,13 +207,12 @@ class ServedModbusDevice:
 
     async def push_all(self) -> dict[str, Any]:
         values = {}
-        if self.server is not None:
-            for topic, point in self.points.items():
-                if topic in self.values:
-                    try:
-                        values[topic] = await self._current(point)
-                    except ValueError:
-                        continue
+        for topic, point in self.points.items():
+            if topic in self.values:
+                try:
+                    values[topic] = await self._current(point)
+                except ValueError:
+                    continue
         if values and self.push is not None:
             await self.push(values)
         return values
@@ -251,12 +231,12 @@ class ServedModbusDevice:
         for spec in affected:
             point = self.by_address.get((table, spec.address))
             if spec.is_pad or point is None or not point.remote_writable:
-                _log.info(f'{self.host}:{self.port}: refusing a write to {table} {address}+{len(values)}: '
+                _log.info(f'unit {self.unit_id}: refusing a write to {table} {address}+{len(values)}: '
                           f'{"pad" if spec.is_pad else "not remotely writable"} at {spec.address}.')
                 return ExcCodes.ILLEGAL_ADDRESS
             covered.update(range(spec.address, spec.end + 1))
         if not affected or any(a not in covered for a in range(address, address + len(values))):
-            _log.info(f'{self.host}:{self.port}: refusing a write to unregistered {table} address {address}+{len(values)}.')
+            _log.info(f'unit {self.unit_id}: refusing a write to unregistered {table} address {address}+{len(values)}.')
             return ExcCodes.ILLEGAL_ADDRESS
         asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(self._after_write(table, affected)))
         return None
@@ -270,7 +250,7 @@ class ServedModbusDevice:
             try:
                 value = await self._current(point)
             except ValueError as e:
-                _log.warning(f'{self.host}:{self.port}: unable to read back {point.topic} after a write: {e}')
+                _log.warning(f'unit {self.unit_id}: unable to read back {point.topic} after a write: {e}')
                 continue
             self.values[point.topic] = value
             values[point.topic] = value
@@ -278,4 +258,110 @@ class ServedModbusDevice:
             try:
                 await self.push(values)
             except Exception as e:    # pragma: no cover
-                _log.warning(f'{self.host}:{self.port}: unable to push the master\'s write: {e}')
+                _log.warning(f'unit {self.unit_id}: unable to push the master\'s write: {e}')
+
+
+class ModbusListener:
+    """A pymodbus server on one transport endpoint, serving one or more units."""
+
+    def __init__(self, transport: str, address: str, port: int | None = None, *, cert_path: str | None = None,
+                 key_path: str | None = None, ca_path: str | None = None, client_auth: bool = False,
+                 baudrate: int = 9600, bytesize: int = 8, parity: str = 'N', stopbits: float = 1):
+        transport = str(transport).lower().strip()
+        if transport not in TRANSPORTS:
+            raise ValueError(f'unsupported transport {transport!r}; one of {TRANSPORTS}')
+        self.transport, self.address = transport, str(address)
+        self.port = int(port) if port is not None else DEFAULT_PORTS.get(transport, 0)
+        self.cert_path, self.key_path, self.ca_path, self.client_auth = cert_path, key_path, ca_path, bool(client_auth)
+        self.baudrate, self.bytesize, self.parity, self.stopbits = int(baudrate), int(bytesize), str(parity)[:1].upper() or 'N', stopbits
+        self.units: dict[int, ServedUnit] = {}
+        self.server = None
+
+    @classmethod
+    def key(cls, transport: str, address: str, port: int | None) -> str:
+        transport = str(transport).lower().strip()
+        if transport == 'serial':
+            return f'served:serial:{address}'
+        return f"served:{transport}:{address}:{port if port is not None else DEFAULT_PORTS.get(transport, 0)}"
+
+    @property
+    def bound_port(self) -> int | None:
+        if self.transport == 'serial':
+            return None
+        transport = getattr(self.server, 'transport', None)
+        sockets = getattr(transport, 'sockets', None)
+        if sockets:
+            return sockets[0].getsockname()[1]
+        if transport is not None and hasattr(transport, 'get_extra_info'):
+            sockname = transport.get_extra_info('sockname')
+            if sockname:
+                return sockname[1]
+        return self.port
+
+    def describe(self) -> dict:
+        return {'role': 'slave', 'transport': self.transport, 'address': self.address, 'port': self.bound_port,
+                'units': {unit_id: unit.describe() for unit_id, unit in self.units.items()}, 'listening': self.server is not None}
+
+    def add_unit(self, unit: ServedUnit):
+        unit.listener = self
+        self.units[unit.unit_id] = unit
+
+    def remove_unit(self, unit_id: int) -> ServedUnit | None:
+        unit = self.units.pop(unit_id, None)
+        if unit is not None:
+            unit.listener = None
+        return unit
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        if not self.cert_path:
+            raise ValueError('A served Modbus TLS unit needs cert_path and key_path (its server certificate).')
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert_path, self.key_path or None)
+        if self.client_auth:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            if self.ca_path:
+                ctx.load_verify_locations(self.ca_path)
+        return ctx
+
+    def _sentinel(self) -> SimDevice:
+        """Unit 0 of invalid registers: requests for units this listener does not serve answer ILLEGAL_ADDRESS."""
+        return SimDevice(id=0, simdata=([SimData(0, 1, False, DataType.BITS)], [SimData(0, 1, False, DataType.BITS)],
+                                        [SimData(0, 1, datatype=DataType.INVALID)], [SimData(0, 1, datatype=DataType.INVALID)]))
+
+    async def start(self, values: dict[int, dict[str, Any]] | None = None):
+        """(Re)build the datastore from every unit's point table and serve it. Values of points that stay are kept;
+        ``values`` is ``{unit_id: {topic: value}}`` from the callers, applied ahead of the rows' starting values."""
+        values = values or {}
+        kept = {unit_id: {t: v for t, v in unit.values.items() if t in unit.points} for unit_id, unit in self.units.items()}
+        await self.stop()
+        devices = [unit.sim_device() for unit in self.units.values()]
+        if 0 not in self.units:
+            devices.append(self._sentinel())
+        if self.transport == 'tcp':
+            self.server = ModbusTcpServer(devices, address=(self.address, self.port))
+        elif self.transport == 'udp':
+            self.server = ModbusUdpServer(devices, address=(self.address, self.port))
+        elif self.transport == 'tls':
+            self.server = ModbusTlsServer(devices, address=(self.address, self.port), sslctx=self._ssl_context())
+        else:
+            self.server = ModbusSerialServer(devices, port=self.address, baudrate=self.baudrate, bytesize=self.bytesize,
+                                             parity=self.parity, stopbits=int(self.stopbits), allow_multiple_devices=True)
+        try:
+            await self.server.serve_forever(background=True)
+        except Exception:
+            self.server = None
+            raise
+        if self.port == 0 and self.transport != 'serial':
+            self.port = self.bound_port or 0            # a listener bound to an ephemeral port keeps it across rebuilds
+        for unit_id, unit in self.units.items():
+            await unit.load(values.get(unit_id), kept.get(unit_id, {}))
+        where = self.address if self.transport == 'serial' else f'{self.address}:{self.bound_port}'
+        _log.info(f'Serving Modbus {self.transport} units {sorted(self.units)} on {where}.')
+
+    async def stop(self):
+        if self.server is not None:
+            try:
+                await self.server.shutdown()
+            except Exception as e:    # pragma: no cover
+                _log.debug(f'Error stopping the {self.transport} listener on {self.address}: {e}')
+            self.server = None

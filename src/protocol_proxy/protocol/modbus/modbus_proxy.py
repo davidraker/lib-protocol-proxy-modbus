@@ -16,7 +16,7 @@ from pymodbus import pymodbus_apply_logging_config
 
 from .json import serialize
 from .client import ModbusClient
-from .server import ServedModbusDevice
+from .server import ModbusListener, ServedUnit
 
 _log = logging.getLogger(__name__)
 
@@ -30,10 +30,11 @@ class ModbusProxy(AsyncioProtocolProxy):
 
     Clients (one per gateway, keyed by transport, address and port) are created by REGISTER_REMOTE (or its older name
     REGISTER_DEVICE) with role ``master`` (the default); each holds the register data types of every unit behind it,
-    declared via CONFIGURE_REGISTERS. Role ``slave`` (``server``) makes the proxy serve a unit instead: a pymodbus TCP
-    server on ``bind_host:port`` whose registers hold the registered points. Reads and writes to a served unit are
-    keyed by topic (READ_POINTS ``topics``, WRITE_POINTS ``values``) and the master's accepted writes are pushed as
-    RECEIVE_WRITES, tagged with the caller's remote id. CLOSE_REMOTE stops a served unit.
+    declared via CONFIGURE_REGISTERS. Role ``slave`` (``server``) makes the proxy serve a unit instead: a pymodbus server
+    on a TCP, UDP or TLS socket (``bind_host``, ``port``) or a serial port (``device_address``), one listener per
+    endpoint serving every unit registered on it, whose registers hold the registered points. Reads and writes to a
+    served unit are keyed by topic (READ_POINTS ``topics``, WRITE_POINTS ``values``) and the master's accepted writes
+    are pushed as RECEIVE_WRITES, tagged with the caller's remote id. CLOSE_REMOTE stops serving a unit.
     """
     # Requests to units sharing a gateway queue behind one another (see ModbusClient), so a request may legitimately
     # wait for several other units' timeout-and-retry cycles before it runs. This bounds how long the IPC layer
@@ -44,9 +45,10 @@ class ModbusProxy(AsyncioProtocolProxy):
         pymodbus_apply_logging_config('INFO')
         super(ModbusProxy, self).__init__(**kwargs)
         self.clients: dict[str, ModbusClient] = {}
-        self.servers: dict[str, ServedModbusDevice] = {}        # served units, by listener and unit id
+        self.listeners: dict[str, ModbusListener] = {}          # served endpoints, each serving one or more units
         # The caller's remote id (header version 2) -> (client key, unit id) it registered. Several remotes (unit ids)
-        # share one client when they sit behind the same gateway connection. A served unit's key starts with 'served:'.
+        # share one client when they sit behind the same gateway connection. A served unit's key is its listener's
+        # ('served:...').
         self.remotes: dict[UUID, tuple[str, int]] = {}
         self.loop = asyncio.get_event_loop()
 
@@ -101,51 +103,81 @@ class ModbusProxy(AsyncioProtocolProxy):
             _log.warning(f"Failed to register Modbus device {device_address}: {e}")
             return serialize({'results': {}, 'errors': {'device': str(e)}})
 
+    LISTENER_FIELDS = ('cert_path', 'key_path', 'ca_path', 'client_auth', 'baudrate', 'bytesize', 'parity', 'stopbits')
+
     @staticmethod
-    def server_key(message: dict) -> str:
-        return f"served:{message.get('bind_host', '0.0.0.0')}:{message.get('port', 502)}:{message.get('unit_id', 1)}"
+    def listener_endpoint(message: dict) -> tuple[str, str, int | None]:
+        """``(transport, address, port)`` of the endpoint a slave registration names: a socket (``bind_host``,
+        ``port``) for tcp, udp and tls, the serial port device (``device_address``) for serial."""
+        transport = str(message.get('transport_protocol') or message.get('device_type') or 'tcp').lower().strip()
+        if transport == 'serial':
+            return transport, str(message.get('device_address') or message.get('bind_host') or ''), None
+        port = message.get('port')
+        return transport, str(message.get('bind_host', '0.0.0.0')), None if port in (None, '') else int(port)
 
     async def _register_served(self, remote_id: UUID, message: dict):
-        """Serve a Modbus TCP unit (role ``slave``). Payload: ``bind_host``, ``port``, ``unit_id``, ``tables`` (per
-        table, spec rows with ``topic``, ``remote_writable`` and ``initial_value``) and optionally ``values`` (the
-        caller's current values for points nothing has written). Reply: ``{'server': key, 'configured': ..., 'seeded': n,
-        'port': bound port}``; everything held is pushed as well."""
-        key = self.server_key(message)
-        served = self.servers.get(key)
+        """Serve a Modbus unit (role ``slave``). Payload: ``transport_protocol`` (tcp, udp, tls or serial; tcp by
+        default), ``bind_host`` and ``port`` (or ``device_address`` and the serial settings), the TLS files, ``unit_id``,
+        ``tables`` (per table, spec rows with ``topic``, ``remote_writable`` and ``initial_value``) and optionally
+        ``values`` (the caller's current values, applied ahead of the rows' starting values to a unit this process
+        holds nothing for). Units registered on the same endpoint share one listener. Reply: ``{'server': key,
+        'unit_id': n, 'configured': ..., 'seeded': n, 'port': bound port}``; everything held is pushed as well."""
+        listener = unit = None
+        fresh_listener = fresh_unit = False
         try:
-            if served is None:
-                served = ServedModbusDevice(message.get('bind_host', '0.0.0.0'), int(message.get('port', 502)),
-                                            unit_id=int(message.get('unit_id', 1)))
-                served.push = partial(self._push, served)
-            served.remote_id = remote_id
-            configured = served.configure_points(message.get('tables') or {})
-            await served.start(message.get('values') or {})
+            transport, address, port = self.listener_endpoint(message)
+            key = ModbusListener.key(transport, address, port)
+            unit_id = int(message.get('unit_id', 1))
+            listener = self.listeners.get(key)
+            fresh_listener = listener is None
+            if fresh_listener:
+                if not address:
+                    raise ValueError('A served Modbus unit needs bind_host (tcp, udp, tls) or device_address (serial).')
+                settings = {k: message[k] for k in self.LISTENER_FIELDS if message.get(k) not in (None, '')}
+                listener = ModbusListener(transport, address, port, **settings)
+            unit = listener.units.get(unit_id)
+            fresh_unit = unit is None
+            if fresh_unit:
+                unit = ServedUnit(unit_id)
+                unit.push = partial(self._push, unit)
+            unit.remote_id = remote_id
+            configured = unit.configure_points(message.get('tables') or {})
+            listener.add_unit(unit)
+            await listener.start({unit_id: message.get('values') or {}})
         except Exception as e:      # a bad row, or whatever the listener's bind raised
-            _log.warning(f'Failed to serve Modbus unit {key}: {e}')
-            if served is not None and key not in self.servers:
-                await served.close()
+            _log.warning(f'Failed to serve Modbus unit: {e}')
+            if listener is not None and fresh_listener:
+                await listener.stop()
+            elif listener is not None and fresh_unit and unit is not None:
+                listener.remove_unit(unit.unit_id)              # the other units on the listener keep being served
+                if listener.server is None:
+                    try:
+                        await listener.start()
+                    except Exception as restart_error:    # pragma: no cover
+                        _log.warning(f'Unable to restart the listener without the failed unit: {restart_error}')
             return serialize({'results': {}, 'errors': {'device': str(e)}})
-        self.servers[key] = served
-        self.remotes[remote_id] = (key, served.unit_id)
-        self.loop.create_task(served.push_all())
-        return serialize({'results': {'server': key, 'configured': configured, 'seeded': served.seeded, 'port': served.bound_port},
-                          'errors': {}})
+        self.listeners[key] = listener
+        self.remotes[remote_id] = (key, unit_id)
+        self.loop.create_task(unit.push_all())
+        return serialize({'results': {'server': key, 'unit_id': unit_id, 'configured': configured, 'seeded': unit.seeded,
+                                      'port': listener.bound_port}, 'errors': {}})
 
-    async def _push(self, served: ServedModbusDevice, values: dict):
+    async def _push(self, unit: ServedUnit, values: dict):
         """Send a master's accepted writes to the manager, keyed by topic and tagged with the caller's remote id."""
         peer = self.peers.get(self.manager)
         if peer is None:    # pragma: no cover
             return
         await self.send(peer, ProtocolProxyMessage(method_name='RECEIVE_WRITES', payload=serialize(values),
-                                                   remote_id=served.remote_id))
+                                                   remote_id=unit.remote_id))
 
-    def _served(self, headers, action: str) -> ServedModbusDevice | None:
+    def _served(self, headers, action: str) -> ServedUnit | None:
         remote_id = getattr(headers, 'remote_id', None)
         registered = self.remotes.get(remote_id) if remote_id else None
-        served = self.servers.get(registered[0]) if registered else None
-        if served is None:
+        listener = self.listeners.get(registered[0]) if registered else None
+        unit = listener.units.get(registered[1]) if listener is not None else None
+        if unit is None:
             _log.warning(f'Failed to {action}: remote {remote_id} has no served unit.')
-        return served
+        return unit
 
     @callback
     async def read_points_endpoint(self, headers, raw_message: bytes):
@@ -169,12 +201,18 @@ class ModbusProxy(AsyncioProtocolProxy):
 
     @callback
     async def close_remote_endpoint(self, headers, raw_message: bytes):
+        """Stop serving the caller's unit; the listener stays up for other units and stops with its last one."""
         remote_id = getattr(headers, 'remote_id', None)
         registered = self.remotes.pop(remote_id, None) if remote_id else None
-        served = self.servers.pop(registered[0], None) if registered else None
-        if served is not None:
-            await served.close()
-        return serialize({'results': {'closed': served is not None}, 'errors': {}})
+        listener = self.listeners.get(registered[0]) if registered else None
+        unit = listener.remove_unit(registered[1]) if listener is not None else None
+        if unit is not None:
+            if listener.units:
+                await listener.start()
+            else:
+                await listener.stop()
+                self.listeners.pop(registered[0], None)
+        return serialize({'results': {'closed': unit is not None}, 'errors': {}})
 
     @callback
     async def configure_registers_endpoint(self, headers, raw_message: bytes):

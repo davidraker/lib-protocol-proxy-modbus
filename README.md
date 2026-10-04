@@ -79,12 +79,19 @@ A `tables` block maps a table name to a list of register specifications:
 
 ## Slave role
 
-A registration whose `role` is `slave` (or `server`) makes the proxy *serve* a Modbus TCP unit instead of reaching one:
-a pymodbus `ModbusTcpServer` on `bind_host:port` answering as `unit_id`, whose four register tables hold the registered
-points. The `tables` block is the same as above, with each row also naming its `topic`, whether the master may write it
-(`remote_writable`; coils and holding registers by default, never inputs or pads) and an `initial_value`. Each table is
-served as one block covering its configured addresses; reads outside it, and writes to pads, to unregistered
-registers or to points that are not remote-writable, are answered with ILLEGAL DATA ADDRESS.
+A registration whose `role` is `slave` (or `server`) makes the proxy *serve* a Modbus unit instead of reaching one. The
+endpoint is named by `transport_protocol`: `tcp` (the default), `udp` or `tls` listen on `bind_host:port` (`tls` with the
+server certificate `cert_path`/`key_path` and, with `client_auth`, the `ca_path` the masters' certificates are checked
+against); `serial` serves on the port `device_address` with `baudrate`, `bytesize`, `parity` and `stopbits`. Units
+registered on the same endpoint share one listener (a gateway-style device, or several units on one serial line); the
+listener is rebuilt when a unit is added, changed or closed, keeping the values of the points that stay, and stops with
+its last unit. Requests for a unit the listener does not serve are answered ILLEGAL DATA ADDRESS.
+
+Each unit's four register tables hold its registered points. The `tables` block is the same as above, with each row also
+naming its `topic`, whether the master may write it (`remote_writable`; coils and holding registers by default, never
+inputs or pads) and an `initial_value`. Each table is served as one block covering its configured addresses; reads
+outside it, and writes to pads, to unregistered registers or to points that are not remote-writable, are answered with
+ILLEGAL DATA ADDRESS.
 
 Reads and writes to a served unit are keyed by topic: `READ_POINTS` (`topics`) reports the decoded register values,
 `WRITE_POINTS` (`values`) encodes the platform's values into the registers (any table, including inputs: they are the
