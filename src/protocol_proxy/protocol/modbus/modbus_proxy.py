@@ -119,8 +119,7 @@ class ModbusProxy(AsyncioProtocolProxy):
                 served.push = partial(self._push, served)
             served.remote_id = remote_id
             configured = served.configure_points(message.get('tables') or {})
-            await served.start()
-            await served.seed(message.get('values') or {})
+            await served.start(message.get('values') or {})
         except Exception as e:      # a bad row, or whatever the listener's bind raised
             _log.warning(f'Failed to serve Modbus unit {key}: {e}')
             if served is not None and key not in self.servers:

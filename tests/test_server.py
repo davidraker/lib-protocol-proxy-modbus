@@ -108,13 +108,22 @@ async def test_starting_values_reads_and_platform_writes(served):
     assert served.pushes.values == []                                   # the platform's own writes are not pushed
 
 
-async def test_seed_fills_only_unwritten_points(served):
-    assert await served.seed({'s/Temp': 21, 's/Mode': 9, 's/zz': 1}) == 1       # Mode has a starting value: kept
-    results, _ = await served.read(['s/Temp', 's/Mode'])
-    assert results == {'s/Temp': 21, 's/Mode': 3}
-    assert await served.seed({'s/Temp': 22}) == 0
-    table = await served.push_all()
-    assert table['s/Temp'] == 21 and 's/Name' not in table                 # never written: not in the table
+async def test_registration_values_beat_starting_values_but_not_held_ones():
+    fresh = ServedModbusDevice('127.0.0.1', 0, unit_id=7)
+    fresh.configure_points(TABLES)
+    await fresh.start({'s/Temp': 21, 's/Mode': 9, 's/zz': 1, 's/Name': None})
+    try:
+        assert fresh.seeded == 2
+        results, _ = await fresh.read(['s/Temp', 's/Mode', 's/CO2Stpt'])
+        assert results == {'s/Temp': 21, 's/Mode': 9, 's/CO2Stpt': 1000.0}         # seed beats the starting value
+        await fresh.write({'s/Temp': 5})
+        await fresh.start({'s/Temp': 99, 's/Mode': 1})                             # a restart of the caller: held values win
+        results, _ = await fresh.read(['s/Temp', 's/Mode'])
+        assert results == {'s/Temp': 5, 's/Mode': 9} and fresh.seeded == 0
+        table = await fresh.push_all()
+        assert table['s/Temp'] == 5 and 's/Name' not in table                      # never written: not in the table
+    finally:
+        await fresh.close()
 
 
 async def test_master_reads_and_writes(served, master):
@@ -180,12 +189,12 @@ async def test_proxy_serves_and_closes_a_unit():
                                                         'tables': TABLES, 'values': {'s/Temp': 11, 's/Mode': 1}})
     assert reply['error'] == {}, reply
     key = 'served:127.0.0.1:0:7'
-    assert reply['result']['server'] == key and reply['result']['seeded'] == 1 and reply['result']['port'] > 0
+    assert reply['result']['server'] == key and reply['result']['seeded'] == 2 and reply['result']['port'] > 0
     assert reply['result']['configured']['holding'] == {'points': 3, 'specs': 4}
     served = proxy.servers[key]
     assert proxy.remotes[remote] == (key, 7)
     await asyncio.sleep(0.05)
-    assert pushes and pushes[0][0] == remote and pushes[0][1]['s/Temp'] == 11 and pushes[0][1]['s/Mode'] == 3
+    assert pushes and pushes[0][0] == remote and pushes[0][1]['s/Temp'] == 11 and pushes[0][1]['s/Mode'] == 1   # seeds win
     reply = await call(proxy.read_points_endpoint, {'topics': ['s/Temp']})
     assert reply == {'result': {'s/Temp': 11}, 'error': {}}
     reply = await call(proxy.write_points_endpoint, {'values': {'s/Temp': 12}})

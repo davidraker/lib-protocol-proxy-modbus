@@ -133,8 +133,14 @@ class ServedModbusDevice:
                 blocks.append([SimData(address=start, count=count, values=0, datatype=DataType.REGISTERS)])
         return blocks[0], blocks[1], blocks[2], blocks[3]
 
-    async def start(self, timeout: float = BIND_TIMEOUT):
-        """(Re)build the datastore from the point table and serve it. Values of points that stay are kept."""
+    async def start(self, values: dict[str, Any] | None = None, timeout: float = BIND_TIMEOUT):
+        """(Re)build the datastore from the point table and serve it.
+
+        A point's value comes from, in order: what this process already holds (a platform restart), the caller's
+        current value in ``values`` (the platform's memory, after a proxy restart), the row's ``initial_value``. The
+        number of points seeded from ``values`` is left in ``seeded``.
+        """
+        values = values or {}
         kept = {topic: value for topic, value in self.values.items() if topic in self.points}
         if self.server is not None:
             await self.server.shutdown()
@@ -143,13 +149,21 @@ class ServedModbusDevice:
         self.server = ModbusTcpServer(device, address=(self.host, self.port))
         await self.server.serve_forever(background=True)
         self.values = {}
+        self.seeded = 0
         for topic, point in self.points.items():
-            value = kept.get(topic, point.initial_value)
-            if value not in (None, ''):
-                try:
-                    await self._store(point, value)
-                except (ValueError, TypeError) as e:
-                    _log.warning(f'{self.host}:{self.port}: starting value {value!r} for {topic} ignored: {e}')
+            if topic in kept:
+                value, source = kept[topic], 'held'
+            elif values.get(topic) is not None:
+                value, source = values[topic], 'seed'
+            else:
+                value, source = point.initial_value, 'starting'
+            if value in (None, ''):
+                continue
+            try:
+                await self._store(point, value)
+                self.seeded += source == 'seed'
+            except (ValueError, TypeError) as e:
+                _log.warning(f'{self.host}:{self.port}: {source} value {value!r} for {topic} ignored: {e}')
         _log.info(f'Serving Modbus unit {self.unit_id} on {self.host}:{self.bound_port} with {len(self.points)} points.')
 
     async def close(self):
@@ -209,15 +223,6 @@ class ServedModbusDevice:
                 continue
             results[topic] = {'status': 'stored', 'value': value}
         return results, errors
-
-    async def seed(self, values: dict[str, Any]) -> int:
-        """Apply the caller's values to points nothing has written yet (no stored value, no starting value)."""
-        pending = {t: v for t, v in values.items() if t in self.points and t not in self.values and v is not None}
-        results, errors = await self.write(pending)
-        for topic, error in errors.items():
-            _log.warning(f'Seed value for {topic} ignored: {error}')
-        self.seeded = len(results)
-        return self.seeded
 
     async def push_all(self) -> dict[str, Any]:
         values = {}
