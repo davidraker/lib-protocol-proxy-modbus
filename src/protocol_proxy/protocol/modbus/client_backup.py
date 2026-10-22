@@ -2,12 +2,12 @@ import logging
 
 from typing import Any, Coroutine, Iterable
 
-from pymodbus import ModbusException, pymodbus_apply_logging_config
+from pymodbus import ModbusException
 from pymodbus.client import AsyncModbusSerialClient, AsyncModbusTcpClient, AsyncModbusTlsClient, AsyncModbusUdpClient
 from pymodbus.pdu import ModbusPDU
 
 _log = logging.getLogger(__name__)
-pymodbus_apply_logging_config('INFO')
+logging.getLogger('pymodbus').setLevel(logging.INFO)
 
 
 class ModbusClient:

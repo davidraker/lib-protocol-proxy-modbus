@@ -12,8 +12,6 @@ from functools import partial
 from protocol_proxy.ipc import callback, ProtocolProxyMessage
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
-from pymodbus import pymodbus_apply_logging_config
-
 from .json import serialize
 from .client import ModbusClient
 from .server import ModbusListener, ServedUnit
@@ -42,7 +40,9 @@ class ModbusProxy(AsyncioProtocolProxy):
     DEFAULT_CALLBACK_TIMEOUT = 120.0
 
     def __init__(self, callback_timeout: float = DEFAULT_CALLBACK_TIMEOUT, **kwargs):
-        pymodbus_apply_logging_config('INFO')
+        # Level only: pymodbus_apply_logging_config would add its own StreamHandler, printing a second, plain copy
+        # of every record to stderr beside the proxy's JSON log channel.
+        logging.getLogger('pymodbus').setLevel(logging.INFO)
         super(ModbusProxy, self).__init__(**kwargs)
         self.clients: dict[str, ModbusClient] = {}
         self.listeners: dict[str, ModbusListener] = {}          # served endpoints, each serving one or more units
