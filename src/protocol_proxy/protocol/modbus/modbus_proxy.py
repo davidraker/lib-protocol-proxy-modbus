@@ -199,6 +199,24 @@ class ModbusProxy(AsyncioProtocolProxy):
         results, errors = await served.write(message.get('values') or {})
         return serialize({'results': results, 'errors': errors})
 
+    async def stop(self):
+        """Close every device connection and served listener before the IPC stops, so nothing is left for the
+        interpreter to reclaim with a ResourceWarning."""
+        for client in list(self.clients.values()):
+            try:
+                client.close()
+            except Exception as e:  # pragma: no cover
+                _log.debug(f'Error closing a Modbus client on stop: {e}')
+        self.clients.clear()
+        for listener in list(self.listeners.values()):
+            try:
+                await listener.stop()
+            except Exception as e:  # pragma: no cover
+                _log.debug(f'Error stopping a served listener on stop: {e}')
+        self.listeners.clear()
+        self.remotes.clear()
+        await super(ModbusProxy, self).stop()
+
     @callback
     async def close_remote_endpoint(self, headers, raw_message: bytes):
         """Stop serving the caller's unit; the listener stays up for other units and stops with its last one."""
