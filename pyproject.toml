@@ -50,6 +50,9 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License"
 ]
 
+[tool.poetry.plugins."protocol_proxy.manifests"]
+modbus = "protocol_proxy.protocol.modbus:proxy.toml"
+
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
 pymodbus = ">=3.13,<4.0"

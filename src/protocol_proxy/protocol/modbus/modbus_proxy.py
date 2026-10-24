@@ -330,11 +330,3 @@ class ModbusProxy(AsyncioProtocolProxy):
                 _log.error(f"Unsupported transport protocol: {transport_protocol}")
                 return ''
 
-    @classmethod
-    def get_unique_remote_id(cls, unique_remote_id: tuple) -> tuple:
-        """Identify the proxy process a caller wants.
-
-        Modbus clients bind no local resources, so by default every device shares one process and callers pass a
-        constant. A site wanting several processes may append a group name; the tuple is used as-is.
-        """
-        return tuple(unique_remote_id)

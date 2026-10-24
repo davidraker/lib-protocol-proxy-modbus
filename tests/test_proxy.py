@@ -11,6 +11,9 @@ from protocol_proxy.protocol.modbus import json as modbus_json
 from protocol_proxy.protocol.modbus.modbus_proxy import ModbusProxy
 
 from conftest import FakeDevice, FakeResponse, SAMPLE_REGISTERS
+from pathlib import Path as _Path
+from protocol_proxy.manifest import Manifest as _Manifest
+_MANIFEST = _Path(__file__).parents[1] / 'src' / 'protocol_proxy' / 'protocol' / 'modbus' / 'proxy.toml'   # the identity rule lives here now
 
 DEVICE = dict(device_address='10.0.0.4', device_type='tcp', port=1502)
 CLIENT_KEY = 'tcp:10.0.0.4:1502'
@@ -177,8 +180,9 @@ def test_get_client_key_includes_transport():
 
 def test_unique_remote_id_is_passed_through():
     """The manager uses this to decide whether to launch a new process; callers pass a constant, or add a group."""
-    assert ModbusProxy.get_unique_remote_id(('modbus',)) == ('modbus',)
-    assert ModbusProxy.get_unique_remote_id(['modbus', 'plant-b']) == ('modbus', 'plant-b')
+    manifest = _Manifest.load(_MANIFEST)
+    assert manifest.process_key(('modbus',), {}) == ('modbus',)
+    assert manifest.process_key(['modbus', 'plant-b'], {}) == ('modbus', 'plant-b')
 
 
 def test_proxy_launches_through_generic_entry_point_without_options():
