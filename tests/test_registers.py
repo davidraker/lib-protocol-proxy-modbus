@@ -315,3 +315,21 @@ class TestPlanRanges:
 
     def test_query_block_end(self):
         assert QueryBlock(10, 5, (0,)).end == 14
+
+
+def test_array_spelling_is_an_alias_of_the_struct_form():
+    from protocol_proxy.protocol.modbus.registers import parse_type_spec
+    assert parse_type_spec('array(int16, 4)') == parse_type_spec('4h') == parse_type_spec('int16[4]')
+    assert parse_type_spec('ARRAY(uint16,2)')[1] == 2
+
+
+def test_single_register_boolean():
+    from protocol_proxy.protocol.modbus.registers import RegisterSpec, DATATYPE
+    spec = RegisterSpec(10, 'bool')
+    assert spec.boolean and spec.count == 1 and spec.decode([0], False) is False and spec.decode([7], False) is True
+    assert spec.encode(True, False) == [1] and spec.encode('false', False) == [0]
+    assert RegisterSpec(3, 'bool').decode([True], True) is True                 # coil tables unchanged
+    assert len(RegisterSpec(10, 'bits').decode([1], False)) == 16              # a bit field stays a list
+    assert len(RegisterSpec(10, 'bits[2]').decode([1, 2], False)) == 32
+    assert RegisterSpec(10, DATATYPE.BITS, 1, boolean=True).decode([2], False) is True   # as the interface declares it
+    assert not RegisterSpec(10, DATATYPE.BITS, 1).boolean and not RegisterSpec(10, 'bool[2]').boolean

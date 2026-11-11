@@ -1,7 +1,9 @@
 import asyncio
 import ssl
 import logging
+import time
 
+from collections import Counter
 from contextlib import asynccontextmanager
 from typing import Any, Coroutine, Iterable, Mapping
 
@@ -10,6 +12,7 @@ from pymodbus.exceptions import ConnectionException, ModbusIOException
 from pymodbus.client import AsyncModbusSerialClient, AsyncModbusTcpClient, AsyncModbusTlsClient, AsyncModbusUdpClient
 from pymodbus.framer import FramerType
 from pymodbus.pdu import ModbusPDU
+from pymodbus.pdu.file_message import FileRecord
 
 from .registers import BIT_TABLES, MAX_READ, QueryBlock, ReadBlock, RegisterMap, RegisterSpec, plan_ranges
 
@@ -33,6 +36,28 @@ _WRITE_KWARGS: dict[str, frozenset[str]] = {
     'coil': _COMMON_KWARGS,
     'holding': _COMMON_KWARGS,
 }
+WRITE_MODES = ('auto', 'single', 'multiple')
+ILLEGAL_FUNCTION = 1        # Modbus exception code: the device does not implement the function
+EXCEPTION_NAMES = {1: 'ILLEGAL FUNCTION', 2: 'ILLEGAL DATA ADDRESS', 3: 'ILLEGAL DATA VALUE', 4: 'SERVER DEVICE FAILURE',
+                   5: 'ACKNOWLEDGE', 6: 'SERVER DEVICE BUSY', 8: 'MEMORY PARITY ERROR',
+                   10: 'GATEWAY PATH UNAVAILABLE', 11: 'GATEWAY TARGET DEVICE FAILED TO RESPOND'}
+# Device identification objects (Modbus Application Protocol V1.1b3, 6.21): 0-2 basic (mandatory), 3-6 regular.
+DEVICE_INFORMATION_OBJECTS = {0: 'VendorName', 1: 'ProductCode', 2: 'MajorMinorRevision', 3: 'VendorUrl',
+                              4: 'ProductName', 5: 'ModelName', 6: 'UserApplicationName'}
+# pymodbus diagnostic and identification requests reachable through diagnostics(): name -> client method.
+DIAGNOSTIC_FUNCTIONS = {
+    'report_device_id': 'report_device_id', 'query_data': 'diag_query_data', 'restart_communication': 'diag_restart_communication',
+    'read_diagnostic_register': 'diag_read_diagnostic_register', 'force_listen_only': 'diag_force_listen_only',
+    'clear_counters': 'diag_clear_counters', 'bus_message_count': 'diag_read_bus_message_count',
+    'bus_comm_error_count': 'diag_read_bus_comm_error_count', 'bus_exception_error_count': 'diag_read_bus_exception_error_count',
+    'device_message_count': 'diag_read_device_message_count', 'device_no_response_count': 'diag_read_device_no_response_count',
+    'device_nak_count': 'diag_read_device_nak_count', 'device_busy_count': 'diag_read_device_busy_count',
+    'bus_char_overrun_count': 'diag_read_bus_char_overrun_count', 'iop_overrun_count': 'diag_read_iop_overrun_count',
+    'clear_overrun_counter': 'diag_clear_overrun_counter', 'comm_event_counter': 'diag_get_comm_event_counter',
+    'comm_event_log': 'diag_get_comm_event_log',
+}
+_PDU_HOUSEKEEPING = frozenset({'dev_id', 'transaction_id', 'retries', 'exception_code', 'bits', 'registers', 'count',
+                               'address', 'space_left'})
 
 
 class ModbusClient:
@@ -48,6 +73,14 @@ class ModbusClient:
         # Requests to one device share one connection and run one at a time. IPC callbacks are dispatched
         # concurrently, so without this two overlapping polls or a poll and a write would interleave on the wire.
         self._lock = asyncio.Lock()
+        # Write functions a unit has refused with ILLEGAL FUNCTION, by (unit_id, table): learned under write_mode
+        # 'auto' so the other form is used from then on without another failed exchange.
+        self._no_single_writes: set[tuple[int, str]] = set()
+        self._no_multiple_writes: set[tuple[int, str]] = set()
+        self._no_mask_writes: set[int] = set()            # units that refused FC22: read-modify-write instead
+        # Health: counters per unit (and under None for the connection itself), see status().
+        self.stats: dict[int | None, dict[str, Any]] = {}
+        self._connected_once = False
 
     @asynccontextmanager
     async def _connection(self):
@@ -60,8 +93,55 @@ class ModbusClient:
             yield self.client
 
     async def _ensure_connected(self):
-        if not self.client.connected and not await self.client.connect():
-            raise ConnectionException(f"Unable to connect to Modbus device {self.device_address}")
+        if not self.client.connected:
+            if self._connected_once:
+                self._unit_stats(None)['reconnects'] += 1
+            if not await self.client.connect():
+                raise ConnectionException(f"Unable to connect to Modbus device {self.device_address}")
+            self._connected_once = True
+
+    # ---- health ------------------------------------------------------------------------------------------------------
+    def _unit_stats(self, unit_id: int | None) -> dict[str, Any]:
+        stats = self.stats.get(unit_id)
+        if stats is None:
+            stats = self.stats[unit_id] = {'requests': 0, 'successes': 0, 'failures': 0, 'timeouts': 0,
+                                           'exception_responses': Counter(), 'reconnects': 0, 'consecutive_failures': 0,
+                                           'last_success': None, 'last_failure': None, 'last_error': None}
+        return stats
+
+    def _record(self, unit_id: int | None, error) -> None:
+        stats = self._unit_stats(unit_id)
+        stats['requests'] += 1
+        if error is None:
+            stats['successes'] += 1
+            stats['consecutive_failures'] = 0
+            stats['last_success'] = time.time()
+            return
+        stats['failures'] += 1
+        stats['consecutive_failures'] += 1
+        stats['last_failure'] = time.time()
+        code = getattr(error, 'exception_code', None)
+        if code is not None:
+            stats['exception_responses'][code] += 1
+            stats['last_error'] = f'{EXCEPTION_NAMES.get(code, "exception " + str(code))} (code {code})'
+        else:
+            if 'No response' in str(error) or 'Timeout' in str(error) or 'timed out' in str(error).lower():
+                stats['timeouts'] += 1
+            stats['last_error'] = str(error)
+
+    def status(self, unit_id: int | None = None) -> dict[str, Any]:
+        """Health of this connection and of one unit (or every unit when None): request counters, exception responses
+        by code, timeouts, reconnects, the last error, and the write functions the units have refused."""
+        def view(key):
+            stats = dict(self._unit_stats(key))
+            stats['exception_responses'] = {str(code): n for code, n in stats['exception_responses'].items()}
+            return stats
+        units = [unit_id] if unit_id is not None else sorted(k for k in self.stats if k is not None)
+        return {'device_address': self.device_address, 'transport': self.device_type, 'connected': bool(self.client.connected),
+                'connection': view(None), 'units': {str(u): view(u) for u in units},
+                'refused_single_writes': sorted(f'{u}:{t}' for u, t in self._no_single_writes),
+                'refused_multiple_writes': sorted(f'{u}:{t}' for u, t in self._no_multiple_writes),
+                'refused_mask_writes': sorted(self._no_mask_writes)}
 
 
     def close(self):
@@ -255,10 +335,10 @@ class ModbusClient:
 
         async def request(start: int, count: int) -> tuple[list | None, Any]:
             response, error = await self._execute(
-                lambda: self._get_read_coroutine(register_map, start, count=count, device_id=unit_id, **kwargs))
+                lambda: self._get_read_coroutine(register_map, start, count=count, device_id=unit_id, **kwargs), unit_id)
             if error is not None:
                 return None, error
-            return (response.bits if bit_table else response.registers), None
+            return self._read_values(register_map, response), None
 
         async with self._connection():
             if queries is None:
@@ -270,6 +350,17 @@ class ModbusClient:
             if decode:
                 return await self._read_decoded_queries(reg_map, queries, blocks, request)
             return await self._read_raw_queries(queries, blocks, request)
+
+    @staticmethod
+    def _read_values(register_map: str, response) -> list:
+        """What a read reply carries for a table: bits, registers, or the one value of an addressless function."""
+        if register_map in BIT_TABLES:
+            return response.bits
+        if register_map == 'exception_status':
+            return [response.status]
+        if register_map == 'fifo_queue':
+            return list(response.values)
+        return response.registers
 
     @staticmethod
     async def _read_raw_queries(queries, blocks, request) -> dict:
@@ -373,7 +464,7 @@ class ModbusClient:
         return tuple(specs)
 
     async def write(self, queries: Iterable[tuple[int, int, Any]], register_map: str = 'holding', unit_id: int = 1,
-                    encode: bool = False, **kwargs):
+                    encode: bool = False, write_mode: str = 'auto', **kwargs):
         """Write registers to one table on one device.
 
         Each query is (start, count, values). With encode False, values must already be a list of register ints
@@ -381,9 +472,20 @@ class ModbusClient:
         True, start must be the address of a point in this client's RegisterMap, values is the Python value for
         that point, and count (if not None) must match the point's configured count.
 
+        write_mode chooses the function code. 'auto' (the default) writes one register or coil with the single-write
+        function (FC06, FC05) and more with the multiple-write function (FC16, FC15); a unit that answers ILLEGAL
+        FUNCTION is retried once with the other form and remembered, so later writes use the form it accepts.
+        'multiple' always uses FC16/FC15; 'single' always uses FC06/FC05 and refuses a value that spans several
+        registers.
+
+        A query may carry a fourth element, a bit index: ``(start, None, value, bit)`` writes that one bit of the
+        holding register at start with FC22 mask write, or by read-modify-write when the unit refuses FC22.
+
         'results' holds {'address', 'count'} from each acknowledged write, aligned with 'errors', one per query.
         """
         # TODO: This may need different parameters for different query types. Needs more fleshed out.
+        if write_mode not in WRITE_MODES:
+            raise ValueError(f"write_mode must be one of {', '.join(WRITE_MODES)}, not {write_mode!r}.")
         bit_table = register_map in BIT_TABLES
         reg_map = None
         if encode:
@@ -392,7 +494,14 @@ class ModbusClient:
                 raise ValueError(f"No register data types have been configured for {register_map} on unit {unit_id}.")
         responses = {'results': [], 'errors': []}
         async with self._connection():
-            for start_register, count, values in queries:
+            for query in queries:
+                start_register, count, values = query[0], query[1], query[2]
+                bit = query[3] if len(query) > 3 else None
+                if bit is not None:
+                    response, error = await self._write_bit(register_map, start_register, int(bit), values, unit_id, kwargs)
+                    responses['results'].append({'address': start_register, 'count': 1, 'bit': int(bit)} if error is None else None)
+                    responses['errors'].append(error)
+                    continue
                 if encode:
                     try:
                         values = self._encode_value(reg_map, start_register, count, values, bit_table)
@@ -400,16 +509,85 @@ class ModbusClient:
                         responses['results'].append(None)
                         responses['errors'].append(f"Error encoding Modbus value: {e}")
                         continue
-                response, error = await self._execute(
-                    lambda: self._get_write_coroutine(register_map, start_register, values, device_id=unit_id,
-                                                      **kwargs))
+                values = list(values)
+                single = self._choose_single_write(write_mode, register_map, unit_id, len(values))
+                if single is None:
+                    responses['results'].append(None)
+                    responses['errors'].append(f"Writing {len(values)} registers at {start_register} needs the"
+                                               f" multiple-write function, but write_mode is 'single'.")
+                    continue
+                response, error = await self._write_once(register_map, start_register, values, unit_id, single, kwargs)
+                if error is not None and write_mode == 'auto' and self._illegal_function(error):
+                    key = (unit_id, register_map)
+                    if single:
+                        self._no_single_writes.add(key)
+                        _log.info(f"Unit {unit_id} on {self.device_address} refused the single-write function for"
+                                  f" {register_map}; using the multiple-write function from now on.")
+                        response, error = await self._write_once(register_map, start_register, values, unit_id, False, kwargs)
+                    elif len(values) == 1:
+                        self._no_multiple_writes.add(key)
+                        _log.info(f"Unit {unit_id} on {self.device_address} refused the multiple-write function for"
+                                  f" {register_map}; using the single-write function for single values from now on.")
+                        response, error = await self._write_once(register_map, start_register, values, unit_id, True, kwargs)
                 if error is None:
-                    responses['results'].append({'address': response.address, 'count': response.count})
+                    responses['results'].append({'address': response.address,
+                                                 'count': getattr(response, 'count', None) or len(values)})
                     responses['errors'].append(None)
                 else:
                     responses['results'].append(None)
                     responses['errors'].append(error)
         return responses
+
+    async def _write_once(self, register_map: str, start: int, values: list, unit_id: int, single: bool, kwargs: dict):
+        return await self._execute(
+            lambda: self._get_write_coroutine(register_map, start, values, single=single, device_id=unit_id, **kwargs),
+            unit_id)
+
+    async def _write_bit(self, register_map: str, address: int, bit: int, value, unit_id: int, kwargs: dict):
+        """Write one bit of a holding register: FC22 mask write, or read-modify-write for a unit that refuses it."""
+        if register_map != 'holding':
+            return None, f"Bit writes apply to holding registers, not the {register_map} table."
+        if not 0 <= bit <= 15:
+            return None, f"Bit index {bit} is out of range for a 16-bit register."
+        if isinstance(value, str):
+            value = value.strip().lower() in ('true', 't', 'on', 'yes', '1')
+        and_mask = 0xFFFF & ~(1 << bit)
+        or_mask = (1 << bit) if value else 0
+        selected = self._select_kwargs(register_map, _WRITE_KWARGS['holding'], kwargs)
+        if unit_id not in self._no_mask_writes:
+            response, error = await self._execute(
+                lambda: self.client.mask_write_register(address=address, and_mask=and_mask, or_mask=or_mask,
+                                                        device_id=unit_id, **selected), unit_id)
+            if error is None or not self._illegal_function(error):
+                return response, error
+            self._no_mask_writes.add(unit_id)
+            _log.info(f"Unit {unit_id} on {self.device_address} refused FC22 mask write; writing bits by"
+                      f" read-modify-write from now on.")
+        current, error = await self._execute(
+            lambda: self.client.read_holding_registers(address, count=1, device_id=unit_id, **selected), unit_id)
+        if error is not None:
+            return None, error
+        word = (current.registers[0] & and_mask) | (or_mask & ~and_mask)
+        single = self._choose_single_write('auto', register_map, unit_id, 1)
+        response, error = await self._write_once(register_map, address, [word], unit_id, bool(single), kwargs)
+        if error is not None and self._illegal_function(error):
+            response, error = await self._write_once(register_map, address, [word], unit_id, not single, kwargs)
+        return response, error
+
+    def _choose_single_write(self, write_mode: str, register_map: str, unit_id: int, count: int) -> bool | None:
+        """Whether to use the single-write function; None when the write cannot be made under the mode."""
+        if write_mode == 'multiple':
+            return False
+        if write_mode == 'single':
+            return True if count == 1 else None
+        if count != 1:
+            return False
+        key = (unit_id, register_map)
+        return key not in self._no_single_writes or key in self._no_multiple_writes
+
+    @staticmethod
+    def _illegal_function(error) -> bool:
+        return getattr(error, 'exception_code', None) == ILLEGAL_FUNCTION
 
     @staticmethod
     def _encode_value(reg_map: RegisterMap, start: int, count: int | None, value: Any, bit_table: bool
@@ -421,7 +599,7 @@ class ModbusClient:
             raise ValueError(f"Count {count} does not match configured count {spec.count} for {spec!r}")
         return spec.encode(value, bit_table)
 
-    async def _execute(self, make_request) -> tuple[ModbusPDU | None, Any]:
+    async def _execute(self, make_request, unit_id: int | None = None) -> tuple[ModbusPDU | None, Any]:
         """Build and await one request, returning (response, None) on success or (None, error) otherwise.
 
         A transport failure (no response, connection lost) may mean the connection is half-open: a device or gateway
@@ -430,20 +608,125 @@ class ModbusClient:
         a new one. The failed request is not retried here: a unit that is merely silent behind a healthy gateway would
         otherwise cost two full timeout-and-retry cycles on the shared bus instead of one.
         """
+        response, error = await self._execute_unrecorded(make_request)
+        self._record(unit_id, error)
+        return response, error
+
+    async def _execute_unrecorded(self, make_request) -> tuple[ModbusPDU | None, Any]:
         try:
             await self._ensure_connected()
             return await self._attempt(make_request)
         except (ModbusIOException, ConnectionException) as e:
+            # pymodbus 3.15 raised a connection error ("Not connected") for a refused handshake; 3.16 reports it as a
+            # read timeout. One message covers both: the device did not answer and the connection is dropped.
             _log.debug(f"Request to {self.device_address} failed ({e}); dropping the connection so the next request"
                        " reconnects.")
             self.client.close()
-            return None, f"Error in Modbus Client: {e}"
+            return None, f"Error in Modbus Client: Not connected or no response: {e}"
         except ModbusException as e:
             return None, f"Error in Modbus Client: {e}"
         except ValueError as e:
             return None, f"Error formulating Modbus query: {e}"
         except Exception as e:
             return None, f"Unexpected error while communicating with Modbus device: {e}"
+
+    # ---- other function codes ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _text(value) -> Any:
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                return bytes(value).decode('utf8').rstrip('\x00')
+            except UnicodeDecodeError:
+                return bytes(value).hex()
+        return value
+
+    @classmethod
+    def _pdu_fields(cls, response) -> dict[str, Any]:
+        """A reply's protocol fields as JSON-friendly values, without the transport housekeeping."""
+        fields = {}
+        for name, value in vars(response).items():
+            if name.startswith('_') or name in _PDU_HOUSEKEEPING:
+                continue
+            if isinstance(value, dict):
+                value = {str(k): cls._text(v) for k, v in value.items()}
+            elif isinstance(value, (list, tuple)):
+                value = [cls._text(v) for v in value]
+            elif hasattr(value, 'value') and not isinstance(value, (int, float, str, bool)):
+                value = value.value              # an enum
+            else:
+                value = cls._text(value)
+            fields[name] = value
+        return fields
+
+    async def device_information(self, read_code: int = 1, object_id: int = 0, unit_id: int = 1) -> dict[str, Any]:
+        """FC43/14 read device identification. read_code 1 basic (VendorName, ProductCode, MajorMinorRevision),
+        2 regular (3-6), 3 extended (device-specific objects), 4 one object (object_id). Objects are returned by
+        name where the standard names them, else by number."""
+        async with self._connection():
+            response, error = await self._execute(
+                lambda: self.client.read_device_information(read_code=read_code, object_id=object_id, device_id=unit_id), unit_id)
+        if error is not None:
+            return {'results': {}, 'errors': {'device_information': str(error)}}
+        objects = {DEVICE_INFORMATION_OBJECTS.get(k, str(k)): self._text(v)
+                   for k, v in (getattr(response, 'information', None) or {}).items()}
+        return {'results': {'objects': objects, 'conformity': getattr(response, 'conformity', None),
+                            'more_follows': bool(getattr(response, 'more_follows', 0)),
+                            'next_object_id': getattr(response, 'next_object_id', None)}, 'errors': {}}
+
+    async def exception_status(self, unit_id: int = 1) -> dict[str, Any]:
+        """FC07 read exception status: the device's eight status bits as an integer and as a list of booleans."""
+        async with self._connection():
+            response, error = await self._execute(lambda: self.client.read_exception_status(device_id=unit_id), unit_id)
+        if error is not None:
+            return {'results': {}, 'errors': {'exception_status': str(error)}}
+        status = int(response.status)
+        return {'results': {'status': status, 'bits': [bool(status >> i & 1) for i in range(8)]}, 'errors': {}}
+
+    async def diagnostics(self, function: str, unit_id: int = 1, **arguments) -> dict[str, Any]:
+        """FC08 diagnostics, FC17 report server id, FC11/FC12 event counter and log, by the names in
+        DIAGNOSTIC_FUNCTIONS. ``arguments`` are the request's own (``msg`` for query_data)."""
+        method_name = DIAGNOSTIC_FUNCTIONS.get(function)
+        if method_name is None:
+            return {'results': {}, 'errors': {'diagnostics': f"Unknown diagnostic function {function!r}; known:"
+                                                             f" {', '.join(sorted(DIAGNOSTIC_FUNCTIONS))}"}}
+        if function == 'query_data' and isinstance(arguments.get('msg'), str):
+            arguments['msg'] = arguments['msg'].encode('utf8')
+        method = getattr(self.client, method_name)
+        async with self._connection():
+            response, error = await self._execute(lambda: method(device_id=unit_id, **arguments), unit_id)
+        if error is not None:
+            return {'results': {}, 'errors': {'diagnostics': str(error)}}
+        return {'results': {'function': function, **self._pdu_fields(response)}, 'errors': {}}
+
+    async def file_record(self, action: str, records: Iterable[Mapping[str, Any]], unit_id: int = 1) -> dict[str, Any]:
+        """FC20/FC21 read or write file records. Each record names file_number, record_number and record_length;
+        a write also carries record_data as a list of 16-bit values."""
+        if action not in ('read', 'write'):
+            return {'results': {}, 'errors': {'file_record': f"action must be 'read' or 'write', not {action!r}."}}
+        try:
+            built = []
+            for record in records:
+                file_number, record_number = int(record['file_number']), int(record['record_number'])
+                if action == 'write':      # pymodbus takes either the data (a write) or the length (a read), not both
+                    data = b''.join(int(v).to_bytes(2, 'big') for v in record['record_data'])
+                    built.append(FileRecord(file_number=file_number, record_number=record_number, record_data=data))
+                else:
+                    built.append(FileRecord(file_number=file_number, record_number=record_number,
+                                            record_length=int(record['record_length'])))
+        except (KeyError, TypeError, ValueError) as e:
+            return {'results': {}, 'errors': {'file_record': f'Bad record specification: {e}'}}
+        method = self.client.read_file_record if action == 'read' else self.client.write_file_record
+        async with self._connection():
+            response, error = await self._execute(lambda: method(built, device_id=unit_id), unit_id)
+        if error is not None:
+            return {'results': {}, 'errors': {'file_record': str(error)}}
+        out = []
+        for record in getattr(response, 'records', []) or []:
+            data = bytes(getattr(record, 'record_data', b''))
+            out.append({'file_number': record.file_number, 'record_number': record.record_number,
+                        'record_length': record.record_length,
+                        'record_data': [int.from_bytes(data[i:i + 2], 'big') for i in range(0, len(data) - 1, 2)]})
+        return {'results': {'records': out}, 'errors': {}}
 
     @staticmethod
     async def _attempt(make_request) -> tuple[ModbusPDU | None, Any]:
@@ -492,15 +775,21 @@ class ModbusClient:
             case _:
                 raise ValueError(f"Attempt to query unknown Modbus register map: {register_map}")
 
-    def _get_write_coroutine(self, register_map: str, start, values, **kwargs) -> Coroutine[Any, Any, ModbusPDU] | None:
+    def _get_write_coroutine(self, register_map: str, start, values, single: bool = False, **kwargs
+                             ) -> Coroutine[Any, Any, ModbusPDU] | None:
+        """The pymodbus write for a table: FC16/FC15 for ``values``, or FC06/FC05 for its one value when ``single``."""
         allowed = _WRITE_KWARGS.get(register_map)
         if allowed is None:
             raise ValueError(f"Attempt to query unknown Modbus register map: {register_map}")
         selected = self._select_kwargs(register_map, allowed, kwargs)
+        if single and len(values) != 1:
+            raise ValueError(f"A single-register write takes one value, not {len(values)}.")
         match register_map:
             case 'holding':
-                return self.client.write_registers(start, values, **selected)
+                return (self.client.write_register(start, values[0], **selected) if single
+                        else self.client.write_registers(start, values, **selected))
             case 'coil':
-                return self.client.write_coils(start, values, **selected)
+                return (self.client.write_coil(start, values[0], **selected) if single
+                        else self.client.write_coils(start, values, **selected))
             case _:
                 raise ValueError(f"Attempt to write to unknown Modbus register map: {register_map}")

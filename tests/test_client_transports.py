@@ -103,7 +103,7 @@ async def test_tls_client_with_mutual_authentication(tmp_path):
         # Without a client certificate the server refuses the handshake.
         anonymous = await ModbusClient.create('127.0.0.1', 'tls', port=listener.bound_port, timeout=1, retries=0, ca_path=certs['ca'])
         result = await anonymous.read([(1010, 1)], register_map='holding', unit_id=7)
-        assert result['errors'][0] and 'Not connected' in result['errors'][0] and result['results'] == [None]
+        assert result['errors'][0] and 'Not connected or no response' in result['errors'][0] and result['results'] == [None]
         anonymous.close()
     finally:
         await listener.stop()

@@ -13,12 +13,16 @@ from protocol_proxy.protocol.modbus.client import ModbusClient
 class FakeResponse:
     """Minimal stand-in for a pymodbus PDU."""
 
-    def __init__(self, registers=None, bits=None, address=None, count=None, error=False):
+    def __init__(self, registers=None, bits=None, address=None, count=None, error=False, exception_code=None, **fields):
         self.registers = registers if registers is not None else []
         self.bits = bits if bits is not None else []
         self.address = address
         self.count = count
         self.error = error
+        if exception_code is not None:
+            self.exception_code = exception_code      # a Modbus exception response; 1 is ILLEGAL FUNCTION
+        for name, value in fields.items():            # the fields of other replies (status, information, message ...)
+            setattr(self, name, value)
 
     def isError(self):
         return self.error
@@ -44,6 +48,7 @@ class FakeDevice:
         self.unreachable = set(unreachable)  # addresses whose requests time out (no answer at all)
         self.delay = delay                   # simulated request duration
         self.events = events if events is not None else []
+        self.unsupported: set[str] = set()   # pymodbus method names the device answers with ILLEGAL FUNCTION
         self.calls: list[tuple[str, dict]] = []
         self.connections = 0            # connect() calls
         self.connected = False
@@ -80,6 +85,8 @@ class FakeDevice:
 
     def _respond(self, name, bound):
         address = bound.get('address', 0)
+        if name in self.unsupported:
+            return FakeResponse(error=True, exception_code=1)
         if name in ('read_holding_registers', 'read_input_registers'):
             span = range(address, address + bound['count'])
             if self.unreachable & set(span):
@@ -97,6 +104,31 @@ class FakeDevice:
             for offset, value in enumerate(bound['values']):
                 self.coils[address + offset] = value
             return FakeResponse(address=address, count=len(bound['values']))
+        if name == 'write_register':
+            self.registers[address] = bound['value']
+            return FakeResponse(address=address, count=1)
+        if name == 'write_coil':
+            self.coils[address] = bound['value']
+            return FakeResponse(address=address, count=1)
+        if name == 'mask_write_register':
+            current = self.registers.get(address, 0)
+            self.registers[address] = (current & bound['and_mask']) | (bound['or_mask'] & ~bound['and_mask'])
+            return FakeResponse(address=address, and_mask=bound['and_mask'], or_mask=bound['or_mask'])
+        if name == 'read_device_information':
+            objects = {0: b'ACME', 1: b'X-1', 2: b'1.2'} if bound['read_code'] == 1 else {4: b'Meter', 5: b'M-9'}
+            return FakeResponse(information=objects, conformity=0x82, more_follows=0, next_object_id=0)
+        if name == 'read_exception_status':
+            return FakeResponse(status=0b00000101)
+        if name == 'report_device_id':
+            return FakeResponse(identifier=b'\x11', status=True, byte_count=1)
+        if name.startswith('diag_'):
+            return FakeResponse(message=[bound.get('msg', 7)] if 'msg' in bound else [42])
+        if name == 'read_file_record':
+            from pymodbus.pdu.file_message import FileRecord
+            return FakeResponse(records=[FileRecord(file_number=getattr(r, 'file_number', 0), record_number=getattr(r, 'record_number', 0),
+                                                    record_data=b'\x00\x0a\x00\x0b') for r in bound['records']])
+        if name == 'write_file_record':
+            return FakeResponse(records=list(bound['records']))
         return FakeResponse(registers=[], bits=[])
 
     def requests(self):

@@ -63,7 +63,11 @@ _STRUCT_CODES: dict[str, RegisterDataType] = {
 }
 # Struct codes whose repeat count is a byte count rather than an element count.
 _BYTE_COUNTED_CODES = frozenset({'s', 'x'})
+# Spellings that mean one boolean when they name a register-table point (modbus_tk's bool), as opposed to 'bits'.
+_BOOLEAN_SPELLINGS = frozenset({'bool', 'boolean', 'bit', '?'})
 _TYPE_PATTERN = re.compile(r'^\s*([<>=!@]?)\s*(\d*)\s*([A-Za-z?_][A-Za-z0-9_]*)\s*(?:\[\s*(\d+)\s*\])?\s*$')
+# modbus_tk's array spelling: array(int16, 4) is four int16 values, the same as the struct form 4h or int16[4].
+_ARRAY_PATTERN = re.compile(r'^\s*array\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(\d+)\s*\)\s*$', re.IGNORECASE)
 
 
 def parse_data_type(type_string: str) -> tuple[RegisterDataType, int | None]:
@@ -83,6 +87,8 @@ def parse_type_spec(type_string: str) -> tuple[RegisterDataType, int | None, boo
     runs on) requests the legacy interpretation of the pymodbus-based driver: the value is the little-endian reading of
     the register byte stream, i.e. the registers are taken in reverse order with the bytes of each swapped.
     """
+    if array := _ARRAY_PATTERN.match(type_string):
+        type_string = f'{array.group(1)}[{array.group(2)}]'
     match = _TYPE_PATTERN.match(type_string)
     if not match:
         raise ValueError(f"Unrecognized Modbus data type: {type_string!r}")
@@ -110,6 +116,15 @@ def parse_type_spec(type_string: str) -> tuple[RegisterDataType, int | None, boo
     return data_type, n * (data_type.value[1] or 1), little_endian  # length in elements (registers for PAD/BITS)
 
 
+def is_boolean_spelling(type_string: str) -> bool:
+    """Whether a data type is written as a single boolean (``bool``, ``boolean``, ``bit``, struct ``?``) rather than
+    as a bit field (``bits``, ``BITS``). In a register table the former decodes to one boolean, the latter to a list."""
+    if array := _ARRAY_PATTERN.match(type_string):
+        type_string = f'{array.group(1)}[{array.group(2)}]'
+    match = _TYPE_PATTERN.match(type_string)
+    return bool(match) and match.group(3).lower() in _BOOLEAN_SPELLINGS and not match.group(2)
+
+
 def swap_bytes(registers: Sequence[int]) -> list[int]:
     """Swap the two bytes of every 16-bit register."""
     return [((r & 0xff) << 8) | ((r >> 8) & 0xff) for r in registers]
@@ -117,18 +132,23 @@ def swap_bytes(registers: Sequence[int]) -> list[int]:
 
 class RegisterSpec:
     """The data type and extent of one point (or pad) starting at a Modbus address."""
-    __slots__ = ('address', 'data_type', 'count', 'word_order', 'string_encoding', 'byte_swap')
+    __slots__ = ('address', 'data_type', 'count', 'word_order', 'string_encoding', 'byte_swap', 'boolean')
 
     def __init__(self, address: int, data_type: RegisterDataType | str, count: int | None = None,
-                 word_order: WordOrder | None = None, string_encoding: str = 'utf-8', byte_swap: bool = False):
+                 word_order: WordOrder | None = None, string_encoding: str = 'utf-8', byte_swap: bool = False,
+                 boolean: bool | None = None):
         """
         :param word_order: order of the registers making up a multi-register value. Defaults to 'big', or to
             'little' when data_type is a '<'-prefixed struct format.
         :param byte_swap: swap the two bytes of every register before decoding (after encoding). Set automatically
             for '<'-prefixed struct formats; together with word_order='little' this reads the register byte stream
             little-endian, as the legacy pymodbus driver did.
+        :param boolean: a BITS point in a register table that is one boolean (non-zero register is true), as
+            modbus_tk's ``bool`` was, rather than a list of bits. Inferred from the spelling of a string data_type.
         """
         if isinstance(data_type, str):
+            if boolean is None:
+                boolean = is_boolean_spelling(data_type)
             data_type, parsed_count, little_endian = parse_type_spec(data_type)
             if count is None:
                 count = parsed_count
@@ -157,6 +177,7 @@ class RegisterSpec:
         self.word_order = word_order
         self.string_encoding = string_encoding
         self.byte_swap = bool(byte_swap)
+        self.boolean = bool(boolean) and data_type is DATATYPE.BITS and count == 1
 
     @property
     def is_pad(self) -> bool:
@@ -181,6 +202,8 @@ class RegisterSpec:
             return bits[0] if self.count == 1 else bits
         if self.byte_swap:
             raw = swap_bytes(raw)
+        if self.boolean:
+            return raw[0] != 0          # a boolean held in one register (modbus_tk's bool): non-zero is true
         return ModbusClientMixin.convert_from_registers(raw, self.data_type, self.word_order, self.string_encoding)
 
     def encode(self, value: Any, bit_table: bool) -> list[int] | list[bool]:
@@ -203,6 +226,8 @@ class RegisterSpec:
                 registers.extend([0] * (self.count - len(registers)))
             if self.word_order == 'little':
                 registers.reverse()
+        elif self.boolean and not bit_table:
+            registers = [1 if value else 0]
         else:
             if self.data_type is DATATYPE.BITS and not isinstance(value, list):
                 value = list(value)
@@ -230,7 +255,8 @@ class RegisterSpec:
 
     def __repr__(self) -> str:
         return (f"RegisterSpec({self.address}, {self.data_type.name}, count={self.count},"
-                f" word_order={self.word_order!r}{', byte_swap=True' if self.byte_swap else ''})")
+                f" word_order={self.word_order!r}{', byte_swap=True' if self.byte_swap else ''}"
+                f"{', boolean=True' if self.boolean else ''})")
 
 
 class ReadBlock(NamedTuple):

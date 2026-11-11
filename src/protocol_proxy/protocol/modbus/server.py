@@ -344,8 +344,9 @@ class ModbusListener:
         elif self.transport == 'tls':
             self.server = ModbusTlsServer(devices, address=(self.address, self.port), sslctx=self._ssl_context())
         else:
+            # pymodbus 3.16: a list of devices is the multi-unit form; allow_multiple_devices is gone.
             self.server = ModbusSerialServer(devices, port=self.address, baudrate=self.baudrate, bytesize=self.bytesize,
-                                             parity=self.parity, stopbits=int(self.stopbits), allow_multiple_devices=True)
+                                             parity=self.parity, stopbits=int(self.stopbits))
         try:
             await self.server.serve_forever(background=True)
         except Exception:

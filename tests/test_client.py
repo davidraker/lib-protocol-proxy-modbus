@@ -39,6 +39,13 @@ class TestRequestArguments:
         run(client._get_write_coroutine(register_map, 10, [1, 2], count=2, device_id=7, bogus=1))
         assert device.calls == [(method, {'address': 10, 'values': [1, 2], 'device_id': 7})]
 
+    @pytest.mark.parametrize('register_map, method', [('holding', 'write_register'), ('coil', 'write_coil')])
+    def test_single_write_coroutines(self, client, device, register_map, method):
+        run(client._get_write_coroutine(register_map, 10, [1], single=True, device_id=7))
+        assert device.calls == [(method, {'address': 10, 'value': 1, 'device_id': 7})]
+        with pytest.raises(ValueError, match='one value'):
+            client._get_write_coroutine(register_map, 10, [1, 2], single=True)
+
     def test_ignored_arguments_are_logged(self, client, caplog):
         with caplog.at_level('DEBUG'):
             run(client._get_read_coroutine('holding', 10, count=1, bogus=1))
@@ -279,8 +286,48 @@ class TestWrite:
         assert result == {'results': [{'address': 1001, 'count': 2}], 'errors': [None]}
         assert (device.registers[1001], device.registers[1002]) == (1, 2)
 
+    def test_auto_mode_uses_single_write_functions_for_one_value(self, client, device):
+        result = run(client.write([(1010, None, [9]), (1001, None, [1, 2])]))
+        assert result['errors'] == [None, None] and result['results'] == [{'address': 1010, 'count': 1}, {'address': 1001, 'count': 2}]
+        assert [c[0] for c in device.calls] == ['write_register', 'write_registers']
+        run(client.write([(5, None, [True]), (5, None, [True, False])], register_map='coil'))
+        assert [c[0] for c in device.calls[2:]] == ['write_coil', 'write_coils']
+        assert device.registers[1010] == 9 and device.coils[5] is True and device.coils[6] is False
+
+    def test_auto_mode_learns_a_unit_that_refuses_single_writes(self, client, device):
+        device.unsupported = {'write_register'}
+        result = run(client.write([(1010, None, [9])]))
+        assert result['errors'] == [None] and device.registers[1010] == 9
+        assert [c[0] for c in device.calls] == ['write_register', 'write_registers']     # refused, retried as FC16
+        run(client.write([(1010, None, [10])]))
+        assert [c[0] for c in device.calls[2:]] == ['write_registers']                   # remembered: no second refusal
+        run(client.write([(5, None, [True])], register_map='coil'))
+        assert device.calls[-1][0] == 'write_coil'                                        # learned per table
+
+    def test_auto_mode_learns_a_unit_that_refuses_multiple_writes(self, client, device):
+        device.unsupported = {'write_registers'}
+        client._no_single_writes.add((1, 'holding'))        # as if FC06 had been refused earlier: FC16 is tried first
+        result = run(client.write([(1010, None, [9])]))
+        assert result['errors'] == [None] and [c[0] for c in device.calls] == ['write_registers', 'write_register']
+        result = run(client.write([(1001, None, [1, 2])]))
+        assert result['results'] == [None] and result['errors'][0].isError()             # two registers: nothing else to try
+
+    def test_multiple_mode_always_uses_multiple_write_functions(self, client, device):
+        run(client.write([(1010, None, [9])], write_mode='multiple'))
+        run(client.write([(5, None, [True])], register_map='coil', write_mode='multiple'))
+        assert [c[0] for c in device.calls] == ['write_registers', 'write_coils']
+
+    def test_single_mode_refuses_multi_register_values(self, configured_client, device):
+        result = run(configured_client.write([(1010, None, 9), (1001, None, 2.5)], encode=True, write_mode='single'))
+        assert result['errors'][0] is None and "write_mode is 'single'" in result['errors'][1]
+        assert [c[0] for c in device.calls] == ['write_register'] and device.registers[1010] == 9
+
+    def test_unknown_write_mode(self, client):
+        with pytest.raises(ValueError, match='write_mode must be'):
+            run(client.write([(1010, None, [9])], write_mode='sometimes'))
+
     def test_encoded_write(self, configured_client, device):
-        result = run(configured_client.write([(1001, None, 2.5), (1010, 1, 9)], encode=True))
+        result = run(configured_client.write([(1001, None, 2.5), (1010, 1, 9)], encode=True, write_mode='multiple'))
         assert result == {'results': [{'address': 1001, 'count': 2}, {'address': 1010, 'count': 1}],
                           'errors': [None, None]}
         assert (device.registers[1001], device.registers[1002], device.registers[1010]) == (0x4020, 0, 9)
@@ -294,7 +341,7 @@ class TestWrite:
         assert device.calls == []                             # nothing reached the device
 
     def test_encoded_coil_write(self, configured_client, device):
-        result = run(configured_client.write([(5, None, [True, False])], register_map='coil', encode=True))
+        result = run(configured_client.write([(5, None, [True, False])], register_map='coil', encode=True, write_mode='multiple'))
         assert result == {'results': [{'address': 5, 'count': 2}], 'errors': [None]}
         assert (device.coils[5], device.coils[6]) == (True, False)
 
@@ -342,3 +389,82 @@ class TestConfiguration:
 
     def test_describe_unknown_map(self, client):
         assert client.describe_registers('input', 3) is None
+
+
+class TestBitWrites:
+    def test_bit_write_uses_fc22(self, client, device):
+        device.registers[1010] = 0b0101
+        result = run(client.write([(1010, None, True, 3), (1010, None, False, 0)]))
+        assert result['errors'] == [None, None] and result['results'][0] == {'address': 1010, 'count': 1, 'bit': 3}
+        assert device.registers[1010] == 0b1100 and [c[0] for c in device.calls] == ['mask_write_register'] * 2
+
+    def test_bit_write_falls_back_to_read_modify_write(self, client, device):
+        device.unsupported = {'mask_write_register'}
+        device.registers[1010] = 0b0101
+        result = run(client.write([(1010, None, 'true', 1)]))
+        assert result['errors'] == [None] and device.registers[1010] == 0b0111
+        assert [c[0] for c in device.calls] == ['mask_write_register', 'read_holding_registers', 'write_register']
+        run(client.write([(1010, None, False, 0)]))
+        assert [c[0] for c in device.calls[3:]] == ['read_holding_registers', 'write_register']   # remembered
+        assert device.registers[1010] == 0b0110
+
+    def test_bit_write_validation(self, client, device):
+        result = run(client.write([(5, None, True, 2)], register_map='coil'))
+        assert 'holding registers' in result['errors'][0]
+        result = run(client.write([(1010, None, True, 16)]))
+        assert 'out of range' in result['errors'][0] and device.calls == []
+
+
+class TestOtherFunctionCodes:
+    def test_device_information(self, client, device):
+        result = run(client.device_information(1, 0, unit_id=3))
+        assert result['errors'] == {} and result['results']['objects'] == {'VendorName': 'ACME', 'ProductCode': 'X-1', 'MajorMinorRevision': '1.2'}
+        assert device.calls[-1] == ('read_device_information', {'read_code': 1, 'object_id': 0, 'device_id': 3})
+        assert run(client.device_information(2))['results']['objects'] == {'ProductName': 'Meter', 'ModelName': 'M-9'}
+
+    def test_exception_status(self, client, device):
+        result = run(client.exception_status(unit_id=2))
+        assert result == {'results': {'status': 5, 'bits': [True, False, True, False, False, False, False, False]}, 'errors': {}}
+
+    def test_exception_status_as_a_read(self, client, device):
+        assert run(client.read([(0, 1)], register_map='exception_status')) == {'results': [[5]], 'errors': [None]}
+
+    def test_diagnostics(self, client, device):
+        result = run(client.diagnostics('query_data', unit_id=1, msg='hi'))
+        assert result['results']['function'] == 'query_data' and result['results']['message'] == ['hi']
+        assert device.calls[-1][0] == 'diag_query_data'
+        result = run(client.diagnostics('report_device_id'))
+        assert result['results']['identifier'] == '\x11' and result['results']['status'] is True
+        assert 'Unknown diagnostic function' in run(client.diagnostics('nosuch'))['errors']['diagnostics']
+
+    def test_file_records(self, client, device):
+        result = run(client.file_record('read', [{'file_number': 4, 'record_number': 1, 'record_length': 2}]))
+        assert result == {'results': {'records': [{'file_number': 4, 'record_number': 1, 'record_length': 2, 'record_data': [10, 11]}]}, 'errors': {}}
+        result = run(client.file_record('write', [{'file_number': 4, 'record_number': 1, 'record_data': [1, 2]}]))
+        assert result['errors'] == {} and device.calls[-1][0] == 'write_file_record'
+        assert 'Bad record' in run(client.file_record('write', [{'record_number': 1}]))['errors']['file_record']
+        assert "action must be" in run(client.file_record('erase', []))['errors']['file_record']
+
+
+class TestStatus:
+    def test_counters_per_unit_and_connection(self, client, device):
+        run(client.read([(1001, 1)], unit_id=1))
+        run(client.read([(1100, 1)], unit_id=2))                       # exception response (failing address)
+        device.unsupported = {'write_register'}
+        run(client.write([(1010, None, [1])], unit_id=1))              # refused FC06, learned
+        status = client.status()
+        assert status['connected'] and status['connection']['reconnects'] == 0
+        unit1, unit2 = status['units']['1'], status['units']['2']
+        assert unit1['requests'] == 3 and unit1['successes'] == 2 and unit1['exception_responses'] == {'1': 1}
+        assert unit2['failures'] == 1 and unit2['consecutive_failures'] == 1 and unit2['last_error'] == 'FakeResponse(error=True)'
+        assert status['refused_single_writes'] == ['1:holding']
+        device.connected = False
+        run(client.read([(1001, 1)], unit_id=1))
+        assert client.status(1)['connection']['reconnects'] == 1 and list(client.status(1)['units']) == ['1']
+
+    def test_timeouts_and_last_error(self, client, device):
+        run(client.read([(1001, 1)]))
+        device.stale = True
+        run(client.read([(1001, 1)]))
+        unit = client.status(1)['units']['1']
+        assert unit['timeouts'] == 1 and 'No response' in unit['last_error'] and unit['last_failure'] is not None

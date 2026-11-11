@@ -63,6 +63,12 @@ class ModbusProxy(AsyncioProtocolProxy):
                                timeout=callback_timeout)
         self.register_callback(self.write_registers_endpoint, 'WRITE_REGISTERS', provides_response=True,
                                timeout=callback_timeout)
+        # Other function codes and health, all resolved to the caller's client and unit like a read.
+        for name, handler in (('READ_DEVICE_INFORMATION', self.device_information_endpoint),
+                              ('READ_EXCEPTION_STATUS', self.exception_status_endpoint),
+                              ('DIAGNOSTICS', self.diagnostics_endpoint), ('FILE_RECORD', self.file_record_endpoint),
+                              ('CLIENT_STATUS', self.client_status_endpoint)):
+            self.register_callback(handler, name, provides_response=True, timeout=callback_timeout)
 
     @callback
     async def register_device_endpoint(self, headers, raw_message: bytes):
@@ -280,8 +286,10 @@ class ModbusProxy(AsyncioProtocolProxy):
     async def write_registers_endpoint(self, headers, raw_message: bytes):
         """Endpoint for writing registers to a Modbus device.
 
-        Payload: queries, [register_map], [encode], [unit_id] (default: the registered unit). With encode true, each
-        query's value is encoded using the map declared via CONFIGURE_REGISTERS.
+        Payload: queries, [register_map], [encode], [write_mode], [unit_id] (default: the registered unit). With
+        encode true, each query's value is encoded using the map declared via CONFIGURE_REGISTERS. write_mode is
+        'auto' (FC06/FC05 for one register or coil, FC16/FC15 for more, learning what the unit refuses), 'single' or
+        'multiple'.
         """
         message = json.loads(raw_message.decode('utf8'))
         client, unit_id = self._resolve(headers, message, 'write')
@@ -290,11 +298,63 @@ class ModbusProxy(AsyncioProtocolProxy):
         queries: Iterable[tuple[int, int, list]] = message.pop('queries', [])
         register_map: str = message.pop('register_map', 'holding')
         encode: bool = message.pop('encode', False)
+        write_mode: str = message.pop('write_mode', 'auto')
         try:
-            result = await client.write(queries, register_map, unit_id, encode=encode, **message)
+            result = await client.write(queries, register_map, unit_id, encode=encode, write_mode=write_mode, **message)
         except ValueError as e:
             result = {'results': [], 'errors': [str(e)]}
         return serialize(result)
+
+    @callback
+    async def device_information_endpoint(self, headers, raw_message: bytes):
+        """FC43/14: payload [read_code] (1 basic, 2 regular, 3 extended, 4 one object), [object_id], [unit_id]."""
+        message = json.loads(raw_message.decode('utf8'))
+        client, unit_id = self._resolve(headers, message, 'read device information')
+        if client is None:
+            return serialize({'results': {}, 'errors': {'device_information': 'Client not found'}})
+        return serialize(await client.device_information(int(message.get('read_code', 1)), int(message.get('object_id', 0)), unit_id))
+
+    @callback
+    async def exception_status_endpoint(self, headers, raw_message: bytes):
+        """FC07: the unit's eight exception status bits. Payload: [unit_id]."""
+        message = json.loads(raw_message.decode('utf8'))
+        client, unit_id = self._resolve(headers, message, 'read exception status')
+        if client is None:
+            return serialize({'results': {}, 'errors': {'exception_status': 'Client not found'}})
+        return serialize(await client.exception_status(unit_id))
+
+    @callback
+    async def diagnostics_endpoint(self, headers, raw_message: bytes):
+        """FC08 sub-functions, FC17 report server id, FC11/FC12 event counter and log. Payload: function (a name from
+        the client's DIAGNOSTIC_FUNCTIONS), [arguments] for the request, [unit_id]."""
+        message = json.loads(raw_message.decode('utf8'))
+        client, unit_id = self._resolve(headers, message, 'run diagnostics')
+        if client is None:
+            return serialize({'results': {}, 'errors': {'diagnostics': 'Client not found'}})
+        function = message.get('function')
+        if not function:
+            return serialize({'results': {}, 'errors': {'diagnostics': "Payload needs 'function'."}})
+        return serialize(await client.diagnostics(str(function), unit_id, **(message.get('arguments') or {})))
+
+    @callback
+    async def file_record_endpoint(self, headers, raw_message: bytes):
+        """FC20/FC21: payload action ('read' or 'write'), records (file_number, record_number, record_length,
+        [record_data]), [unit_id]."""
+        message = json.loads(raw_message.decode('utf8'))
+        client, unit_id = self._resolve(headers, message, 'access file records')
+        if client is None:
+            return serialize({'results': {}, 'errors': {'file_record': 'Client not found'}})
+        return serialize(await client.file_record(str(message.get('action', 'read')), message.get('records') or [], unit_id))
+
+    @callback
+    async def client_status_endpoint(self, headers, raw_message: bytes):
+        """Health of the caller's connection and unit: request counters, exception responses by code, timeouts,
+        reconnects, the last error, and the write functions the unit has refused. Payload: [unit_id]."""
+        message = json.loads(raw_message.decode('utf8'))
+        client, unit_id = self._resolve(headers, message, 'report status')
+        if client is None:
+            return serialize({'results': {}, 'errors': {'status': 'Client not found'}})
+        return serialize({'results': client.status(unit_id), 'errors': {}})
 
     def _resolve(self, headers, message: dict, action: str) -> tuple[ModbusClient | None, int]:
         """The client and unit id a request concerns, by the remote id in its header.
