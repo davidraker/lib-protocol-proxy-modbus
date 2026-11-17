@@ -429,6 +429,14 @@ class TestOtherFunctionCodes:
     def test_exception_status_as_a_read(self, client, device):
         assert run(client.read([(0, 1)], register_map='exception_status')) == {'results': [[5]], 'errors': [None]}
 
+    def test_fifo_queue_as_a_read_keeps_every_entry_and_never_merges(self, client, device):
+        device.fifos = {10: [7, 8, 9], 11: [1]}
+        result = run(client.read([(10, 1), (11, 1), (12, 1)], register_map='fifo_queue'))
+        assert result == {'results': [[7, 8, 9], [1], []], 'errors': [None, None, None]}
+        assert [c for c in device.calls if c[0] == 'read_fifo_queue'] == [
+            ('read_fifo_queue', {'address': 10, 'device_id': 1}), ('read_fifo_queue', {'address': 11, 'device_id': 1}),
+            ('read_fifo_queue', {'address': 12, 'device_id': 1})]
+
     def test_diagnostics(self, client, device):
         result = run(client.diagnostics('query_data', unit_id=1, msg='hi'))
         assert result['results']['function'] == 'query_data' and result['results']['message'] == ['hi']

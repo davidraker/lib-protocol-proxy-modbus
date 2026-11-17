@@ -50,6 +50,7 @@ The Modbus proxy takes no protocol-specific launch options. Everything about a d
 | `READ_REGISTERS` | Read from one table (`register_map`) on one unit. `queries` are `[start, count]` pairs. With `decode` true, values are decoded using the declared data types and returned keyed by address; omit `queries` to read the whole table in the fewest requests. |
 | `READ_DEVICE_INFORMATION` | FC43/14 device identification: `read_code` 1 basic (VendorName, ProductCode, MajorMinorRevision), 2 regular, 3 extended, 4 one `object_id`; objects returned by standard name. |
 | `READ_EXCEPTION_STATUS` | FC07: the unit's eight status bits as `status` (int) and `bits`. Also readable as a table: `READ_REGISTERS` with `register_map: exception_status`, `queries: [[0, 1]]`. |
+| FIFO queues (FC24) | `READ_REGISTERS` with `register_map: fifo_queue`; each query's start is a FIFO pointer address (the count is ignored) and its result is the whole queue, up to 31 values, as a list. Queries are never merged. |
 | `DIAGNOSTICS` | FC08 sub-functions, FC17 report server id, FC11/FC12 event counter and log: `function` by name (`query_data`, `bus_message_count`, `report_device_id`, `comm_event_counter` ...) with `arguments`. |
 | `FILE_RECORD` | FC20/FC21: `action` read or write, `records` of file_number, record_number, record_length (and record_data for a write). |
 | `CLIENT_STATUS` | Health of the caller's connection and unit: request counters, exception responses by code, timeouts, reconnects, last error, and the write functions the unit refused. |

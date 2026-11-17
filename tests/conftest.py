@@ -49,6 +49,7 @@ class FakeDevice:
         self.delay = delay                   # simulated request duration
         self.events = events if events is not None else []
         self.unsupported: set[str] = set()   # pymodbus method names the device answers with ILLEGAL FUNCTION
+        self.fifos: dict[int, list[int]] = {}  # FIFO pointer address -> queue contents (FC24)
         self.calls: list[tuple[str, dict]] = []
         self.connections = 0            # connect() calls
         self.connected = False
@@ -119,6 +120,8 @@ class FakeDevice:
             return FakeResponse(information=objects, conformity=0x82, more_follows=0, next_object_id=0)
         if name == 'read_exception_status':
             return FakeResponse(status=0b00000101)
+        if name == 'read_fifo_queue':
+            return FakeResponse(values=list(self.fifos.get(address, [])))
         if name == 'report_device_id':
             return FakeResponse(identifier=b'\x11', status=True, byte_count=1)
         if name.startswith('diag_'):

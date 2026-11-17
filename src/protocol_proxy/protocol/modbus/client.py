@@ -349,7 +349,19 @@ class ModbusClient:
                 else [QueryBlock(start, count, (i,)) for i, (start, count) in enumerate(queries)]
             if decode:
                 return await self._read_decoded_queries(reg_map, queries, blocks, request)
+            if register_map == 'fifo_queue':
+                return await self._read_whole_replies(queries, request)
             return await self._read_raw_queries(queries, blocks, request)
+
+    @staticmethod
+    async def _read_whole_replies(queries, request) -> dict:
+        """One request per query, each reply kept whole: a FIFO queue (FC24) is addressed by its pointer register and
+        answers with however many entries it holds (up to 31), so neither merging nor slicing by count applies."""
+        results: list = [None] * len(queries)
+        errors: list = [None] * len(queries)
+        for index, (start, count) in enumerate(queries):
+            results[index], errors[index] = await request(start, count)
+        return {'results': results, 'errors': errors}
 
     @staticmethod
     def _read_values(register_map: str, response) -> list:
